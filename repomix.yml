@@ -1,0 +1,47 @@
+name: Pack repository with Repomix
+
+permissions:
+  contents: write
+
+on:
+  pull_request:
+    types:
+      - closed
+
+jobs:
+  pack-repo:
+    if: github.event.pull_request.merged == true
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v3
+        with:
+          node-version: '20'
+
+      - name: Install repomix
+        run: npm install -g repomix
+
+      - name: Pack repository with repomix
+        run: |
+          # Use default format with line numbers and output to repomix-output.md
+          # Exclude txt and log files from the output
+          repomix -o .openhands/microagents/repo.md --output-show-line-numbers --ignore "**/*.txt,**/*.log,**/*.csv,.openhands/microagents/**"
+
+      - name: Configure Git
+        run: |
+          git config --local user.email "action@github.com"
+          git config --local user.name "GitHub Action"
+
+      - name: Commit Repomix output to repository
+        run: |
+          git add .openhands/microagents/repo.md
+          git commit -m "Update Repomix output [skip ci]" || echo "No changes to commit"
+
+      - name: Push changes
+        uses: ad-m/github-push-action@master
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          branch: ${{ github.ref }}
