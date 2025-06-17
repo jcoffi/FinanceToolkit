@@ -12,6 +12,8 @@ ALPHA_CONSTRAINT = 0.5
 # (e.g. 2020Q1) and the second index the days within that period (January to March)
 MULTI_PERIOD_INDEX_LEVELS = 2
 
+# pylint: disable=cyclic-import
+
 
 def get_evar_gaussian(
     returns: pd.Series | pd.DataFrame, alpha: float

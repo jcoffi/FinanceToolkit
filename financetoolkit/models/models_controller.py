@@ -4,7 +4,7 @@ __docformat__ = "google"
 
 import pandas as pd
 
-from financetoolkit.helpers import calculate_growth, handle_errors
+from financetoolkit.helpers import calculate_growth
 from financetoolkit.models import (
     altman_model,
     dupont_model,
@@ -17,6 +17,7 @@ from financetoolkit.models import (
 )
 from financetoolkit.performance.performance_model import get_beta
 from financetoolkit.ratios import liquidity_model, valuation_model
+from financetoolkit.utilities.error_model import handle_errors
 
 # pylint: disable=too-many-instance-attributes,too-many-locals,too-many-lines
 
@@ -118,6 +119,7 @@ class Models:
         rounding: int | None = None,
         growth: bool = False,
         lag: int | list[int] = 1,
+        trailing: int | None = None,
     ) -> pd.DataFrame:
         """
         Perform a Dupont analysis to breakdown the return on equity (ROE) into its components.
@@ -137,6 +139,7 @@ class Models:
             rounding (int, optional): The number of decimals to round the results to. Defaults to 4.
             growth (bool, optional): Whether to calculate the growth of the values. Defaults to False.
             lag (int | str, optional): The lag to use for the growth calculation. Defaults to 1.
+            trailing (int | None, optional): The trailing period to use for the calculation. Defaults to None.
 
         Returns:
             pd.DataFrame: DataFrame containing Dupont analysis results, including Profit Margin, Asset
@@ -160,14 +163,35 @@ class Models:
         dupont_analysis = toolkit.models.get_dupont_analysis()
         ```
         """
-        self._dupont_analysis = dupont_model.get_dupont_analysis(
-            self._income_statement.loc[:, "Net Income", :],
-            self._income_statement.loc[:, "Revenue", :],
-            self._balance_sheet_statement.loc[:, "Total Assets", :].shift(axis=1),
-            self._balance_sheet_statement.loc[:, "Total Assets", :],
-            self._balance_sheet_statement.loc[:, "Total Equity", :].shift(axis=1),
-            self._balance_sheet_statement.loc[:, "Total Equity", :],
-        )
+        if trailing:
+            self._dupont_analysis = dupont_model.get_dupont_analysis(
+                self._income_statement.loc[:, "Net Income", :]
+                .T.rolling(trailing)
+                .sum()
+                .T,
+                self._income_statement.loc[:, "Revenue", :].T.rolling(trailing).sum().T,
+                self._balance_sheet_statement.loc[:, "Total Assets", :]
+                .T.rolling(trailing)
+                .mean()
+                .T,
+                self._balance_sheet_statement.loc[:, "Total Equity", :]
+                .T.rolling(trailing)
+                .mean()
+                .T,
+            )
+        else:
+            self._dupont_analysis = dupont_model.get_dupont_analysis(
+                self._income_statement.loc[:, "Net Income", :],
+                self._income_statement.loc[:, "Revenue", :],
+                self._balance_sheet_statement.loc[:, "Total Assets", :]
+                .T.rolling(2)
+                .mean()
+                .T,
+                self._balance_sheet_statement.loc[:, "Total Equity", :]
+                .T.rolling(2)
+                .mean()
+                .T,
+            )
 
         if growth:
             self._dupont_analysis_growth = calculate_growth(
@@ -196,6 +220,7 @@ class Models:
         rounding: int | None = None,
         growth: bool = False,
         lag: int | list[int] = 1,
+        trailing: int | None = None,
     ) -> pd.DataFrame:
         """
         Perform an Extended Dupont analysis to breakdown the return on equity (ROE) into its components,
@@ -219,6 +244,7 @@ class Models:
             rounding (int, optional): The number of decimals to round the results to. Defaults to 4.
             growth (bool, optional): Whether to calculate the growth of the values. Defaults to False.
             lag (int | str, optional): The lag to use for the growth calculation. Defaults to 1.
+            trailing (int | None, optional): The trailing period to use for the calculation. Defaults to None.
 
         Returns:
             pd.DataFrame: DataFrame containing Extended Dupont analysis results, including Profit Margin, Asset Turnover,
@@ -245,16 +271,45 @@ class Models:
         extended_dupont_analysis = toolkit.models.get_extended_dupont_analysis()
         ```
         """
-        self._extended_dupont_analysis = dupont_model.get_extended_dupont_analysis(
-            self._income_statement.loc[:, "Income Before Tax", :],
-            self._income_statement.loc[:, "Operating Income", :],
-            self._income_statement.loc[:, "Net Income", :],
-            self._income_statement.loc[:, "Revenue", :],
-            self._balance_sheet_statement.loc[:, "Total Assets", :].shift(axis=1),
-            self._balance_sheet_statement.loc[:, "Total Assets", :],
-            self._balance_sheet_statement.loc[:, "Total Equity", :].shift(axis=1),
-            self._balance_sheet_statement.loc[:, "Total Equity", :],
-        )
+        if trailing:
+            self._extended_dupont_analysis = dupont_model.get_extended_dupont_analysis(
+                self._income_statement.loc[:, "Income Before Tax", :]
+                .T.rolling(trailing)
+                .sum()
+                .T,
+                self._income_statement.loc[:, "Operating Income", :]
+                .T.rolling(trailing)
+                .sum()
+                .T,
+                self._income_statement.loc[:, "Net Income", :]
+                .T.rolling(trailing)
+                .sum()
+                .T,
+                self._income_statement.loc[:, "Revenue", :].T.rolling(trailing).sum().T,
+                self._balance_sheet_statement.loc[:, "Total Assets", :]
+                .T.rolling(trailing)
+                .mean()
+                .T,
+                self._balance_sheet_statement.loc[:, "Total Equity", :]
+                .T.rolling(trailing)
+                .mean()
+                .T,
+            )
+        else:
+            self._extended_dupont_analysis = dupont_model.get_extended_dupont_analysis(
+                self._income_statement.loc[:, "Income Before Tax", :],
+                self._income_statement.loc[:, "Operating Income", :],
+                self._income_statement.loc[:, "Net Income", :],
+                self._income_statement.loc[:, "Revenue", :],
+                self._balance_sheet_statement.loc[:, "Total Assets", :]
+                .T.rolling(2)
+                .mean()
+                .T,
+                self._balance_sheet_statement.loc[:, "Total Equity", :]
+                .T.rolling(2)
+                .mean()
+                .T,
+            )
 
         if growth:
             self._extended_dupont_analysis_growth = calculate_growth(
@@ -680,21 +735,20 @@ class Models:
 
         intrinsic_values_dict = {}
         for ticker in self._tickers:
+            perpetual_growth_rate_float = perpetual_growth_rate_dict.get(
+                ticker, perpetual_growth_rate
+            )
+            growth_rate_float = growth_rate_dict.get(ticker, growth_rate)
+            weighted_average_cost_of_capital_float = wacc_dict.get(
+                ticker, weighted_average_cost_of_capital
+            )
             intrinsic_values_dict[ticker] = intrinsic_model.get_intrinsic_value(
                 cash_flow=self._cash_flow_statement.loc[ticker, cash_flow_type]
                 .dropna()
                 .iloc[-1],
-                growth_rate=(
-                    growth_rate_dict[ticker] if growth_rate_dict else growth_rate
-                ),
-                perpetual_growth_rate=(
-                    perpetual_growth_rate_dict[ticker]
-                    if perpetual_growth_rate_dict
-                    else perpetual_growth_rate
-                ),
-                weighted_average_cost_of_capital=(
-                    wacc_dict[ticker] if wacc_dict else weighted_average_cost_of_capital
-                ),
+                growth_rate=growth_rate_float,
+                perpetual_growth_rate=perpetual_growth_rate_float,
+                weighted_average_cost_of_capital=weighted_average_cost_of_capital_float,
                 cash_and_cash_equivalents=self._balance_sheet_statement.loc[
                     ticker, "Cash and Cash Equivalents"
                 ]
@@ -1038,12 +1092,12 @@ class Models:
         piotroski_score["Return on Assets Criteria"] = (
             piotroski_model.get_return_on_assets_criteria(
                 net_income=self._income_statement.loc[:, "Net Income", :],
-                total_assets_begin=self._balance_sheet_statement.loc[
+                average_total_assets=self._balance_sheet_statement.loc[
                     :, "Total Assets", :
-                ].shift(axis=1),
-                total_assets_end=self._balance_sheet_statement.loc[
-                    :, "Total Assets", :
-                ],
+                ]
+                .T.rolling(2)
+                .mean()
+                .T,
             )
         )
 
@@ -1058,21 +1112,21 @@ class Models:
         piotroski_score["Change in Return on Assets Criteria"] = (
             piotroski_model.get_change_in_return_on_asset_criteria(
                 net_income=self._income_statement.loc[:, "Net Income", :],
-                total_assets_begin=self._balance_sheet_statement.loc[
+                average_total_assets=self._balance_sheet_statement.loc[
                     :, "Total Assets", :
-                ].shift(axis=1),
-                total_assets_end=self._balance_sheet_statement.loc[
-                    :, "Total Assets", :
-                ],
+                ]
+                .T.rolling(2)
+                .mean()
+                .T,
             )
         )
 
         piotroski_score["Accruals Criteria"] = piotroski_model.get_accruals_criteria(
             net_income=self._income_statement.loc[:, "Net Income", :],
-            total_assets_begin=self._balance_sheet_statement.loc[
-                :, "Total Assets", :
-            ].shift(axis=1),
-            total_assets_end=self._balance_sheet_statement.loc[:, "Total Assets", :],
+            average_total_assets=self._balance_sheet_statement.loc[:, "Total Assets", :]
+            .T.rolling(2)
+            .mean()
+            .T,
             operating_cashflow=self._cash_flow_statement.loc[
                 :, "Operating Cash Flow", :
             ],
@@ -1117,12 +1171,12 @@ class Models:
         piotroski_score["Asset Turnover Criteria"] = (
             piotroski_model.get_asset_turnover_ratio_criteria(
                 sales=self._income_statement.loc[:, "Revenue", :],
-                total_assets_begin=self._balance_sheet_statement.loc[
+                average_total_assets=self._balance_sheet_statement.loc[
                     :, "Total Assets", :
-                ].shift(axis=1),
-                total_assets_end=self._balance_sheet_statement.loc[
-                    :, "Total Assets", :
-                ],
+                ]
+                .T.rolling(2)
+                .mean()
+                .T,
             )
         )
 

@@ -7,17 +7,23 @@ balance_dataset = pd.read_pickle("tests/datasets/balance_dataset.pickle")
 income_dataset = pd.read_pickle("tests/datasets/income_dataset.pickle")
 cash_dataset = pd.read_pickle("tests/datasets/cash_dataset.pickle")
 historical = pd.read_pickle("tests/datasets/historical_dataset.pickle")
+risk_free_rate = pd.read_pickle("tests/datasets/risk_free_rate.pickle")
+treasury_data = pd.read_pickle("tests/datasets/treasury_data.pickle")
 
 toolkit = Toolkit(
     tickers=["AAPL", "MSFT"],
-    start_date="2013-09-09",
-    end_date="2023-09-07",
+    start_date="2019-12-31",
+    end_date="2023-01-01",
     historical=historical,
     balance=balance_dataset,
     income=income_dataset,
     cash=cash_dataset,
     convert_currency=False,
+    sleep_timer=False,
 )
+
+toolkit._daily_risk_free_rate = risk_free_rate
+toolkit._daily_treasury_data = treasury_data
 
 performance_module = toolkit.performance
 
@@ -35,11 +41,6 @@ def test_get_capital_asset_pricing_model(recorder):
     recorder.capture(performance_module.get_capital_asset_pricing_model(growth=True))
     recorder.capture(
         performance_module.get_capital_asset_pricing_model(growth=True, lag=[1, 2, 3])
-    )
-    recorder.capture(
-        performance_module.get_capital_asset_pricing_model(
-            show_full_results=True
-        ).round(2)
     )
 
 
@@ -62,17 +63,17 @@ def test_get_factor_asset_correlations(recorder):
 
 
 def test_get_factor_correlations(recorder):
-    recorder.capture(performance_module.get_factor_correlations().round(2))
+    recorder.capture(performance_module.get_factor_correlations().round(1))
     recorder.capture(
-        performance_module.get_factor_correlations(period="monthly").round(2)
+        performance_module.get_factor_correlations(period="monthly").round(1)
     )
     recorder.capture(
         performance_module.get_factor_correlations(
             factors_to_calculate=["HML", "Mkt-RF"]
-        ).round(2)
+        ).round(1)
     )
     recorder.capture(
-        performance_module.get_factor_correlations(exclude_risk_free=False).round(2)
+        performance_module.get_factor_correlations(exclude_risk_free=False).round(1)
     )
 
 

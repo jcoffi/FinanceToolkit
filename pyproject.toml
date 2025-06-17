@@ -1,13 +1,13 @@
 [tool.poetry]
 name = "financetoolkit"
-version = "1.9.9"
+version = "2.0.3"
 description = "Transparent and Efficient Financial Analysis"
 license = "MIT"
 authors = ["Jeroen Bouma"]
 packages = [
     { include = "financetoolkit" },
 ]
-include = ['normalization/*.csv']
+include = ["normalization/*.csv", "financetoolkit/portfolio/example_datasets/*"]
 readme = "README.md"
 homepage = "https://www.jeroenbouma.com/projects/financetoolkit"
 repository = "https://github.com/JerBouma/FinanceToolkit"
@@ -20,6 +20,7 @@ classifiers = [
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
 ]
 keywords = [
     "Finance",
@@ -42,34 +43,39 @@ keywords = [
 ]
 
 [tool.poetry.dependencies]
-python = ">=3.10, <3.13"
-pandas = {version = "^2.2", extras = ["computation", "performance", "plot"]}
-requests = "^2.32.3"
-scikit-learn = "^1.5"
-yfinance = { version = "*", optional = true }
+python = ">=3.10, <3.14"
+pandas = "^2.2"
+scikit-learn = "^1.6"
+requests = "^2.32"
+yfinance = "*"
+openpyxl = "^3.1"
+tqdm = "^4.67"
 
 [tool.poetry.group.dev.dependencies]
-pytest = "^8.3.3"
-pylint = "^3.3.0"
-codespell = "^2.3.0"
-black = "^24.8.0"
+pytest = "^8.3.5"
+ipykernel = "^6.29.5"
+tqdm = "^4.67.1"
+pylint = "^3.3.6"
+codespell = "^2.4.1"
+black = {extras = ["jupyter"], version = "^25.1.0"}
 pytest-mock = "^3.14.0"
 pytest-recording = "^0.13.2"
-pytest-cov = "^5.0.0"
-ruff = "^0.11.10"
+pytest-cov = "^6.1.1"
 pytest-timeout = "^2.3.1"
-pytest-recorder = "^0.3.0"
-ipykernel = "^6.29.5"
+ruff = "^0.11.4"
+mypy = "^1.15.0"
+types-pyyaml = "^6.0.12.20250402"
+types-requests = "^2.32.0.20250328"
 
 [tool.poetry.group.dashboard.dependencies]
-plotly = "^5.22.0"
-streamlit = "^1.36.0"
+plotly = "^6.0.1"
+streamlit = "^1.44.1"
 
 [tool.poetry.extras]
 yfinance = ["yfinance"]
 
 [build-system]
-requires = ["setuptools<65.5.0", "poetry-core>=1.0.0"]
+requires = ["poetry-core>=1.0.0"]
 build-backend = "poetry.core.masonry.api"
 
 [tool.ruff]
@@ -81,16 +87,17 @@ exclude = ["conftest.py"]
 [tool.pylint]
 max-line-length = 122
 disable = [
-    "R0913",
-    "W1514",
-    "R0911",
-    "R0912",
-    "R0915",
-    "R0801",
-    "W0221",
-    "C0103",
-    "E1131",
+    "R0913", # too-many-arguments
+    "W1514", # using-import-outside-toplevel
+    "R0911", # too-many-return-statements
+    "R0912", # too-many-branches
+    "R0915", # too-many-statements
+    "R0801", # duplicate-code
+    "W0221", # arguments-differ
+    "C0103", # invalid-name
+    "E1131", # unsupported-binary-operation
     "R0917", # too-many-positional-arguments
+    "W0212", # protected-access
     ]
 
 [tool.ruff.lint.isort]

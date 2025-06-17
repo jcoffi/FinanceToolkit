@@ -4,26 +4,27 @@ __docformat__ = "google"
 
 
 import re
+import warnings
+from collections import Counter
 from datetime import datetime, timedelta
 
 import pandas as pd
-import requests
 
-from financetoolkit import helpers
+from financetoolkit import currencies_model, helpers
 from financetoolkit.economics.economics_controller import Economics
 from financetoolkit.fixedincome.fixedincome_controller import FixedIncome
-from financetoolkit.fundamentals_model import (
+from financetoolkit.fmp_model import (
     get_analyst_estimates as _get_analyst_estimates,
     get_dividend_calendar as _get_dividend_calendar,
     get_earnings_calendar as _get_earnings_calendar,
     get_esg_scores as _get_esg_scores,
-    get_financial_statements as _get_financial_statements,
+    get_financial_data as _get_financial_data,
     get_profile as _get_profile,
     get_quote as _get_quote,
     get_rating as _get_rating,
     get_revenue_segmentation as _get_revenue_segmentation,
 )
-from financetoolkit.helpers import calculate_growth as _calculate_growth
+from financetoolkit.fundamentals_model import collect_financial_statements
 from financetoolkit.historical_model import (
     convert_daily_to_other_period as _convert_daily_to_other_period,
     get_historical_data as _get_historical_data,
@@ -31,16 +32,26 @@ from financetoolkit.historical_model import (
 )
 from financetoolkit.models.models_controller import Models
 from financetoolkit.normalization_model import (
-    convert_date_label as _convert_date_label,
-    convert_financial_statements as _convert_financial_statements,
     copy_normalization_files as _copy_normalization_files,
-    read_normalization_file as _read_normalization_file,
+    initialize_statements_and_normalization as _initialize_statements_and_normalization,
 )
 from financetoolkit.options.options_controller import Options
 from financetoolkit.performance.performance_controller import Performance
 from financetoolkit.ratios.ratios_controller import Ratios
 from financetoolkit.risk.risk_controller import Risk
 from financetoolkit.technicals.technicals_controller import Technicals
+from financetoolkit.utilities import cache_model, logger_model
+
+# Set up logger, this is meant to display useful messages, warnings or errors when
+# the Finance Toolkit runs into issues or does something that might not be entirely
+# logical at first
+logger_model.setup_logger()
+logger = logger_model.get_logger()
+
+# Runtime errors are ignored on purpose given the nature of the calculations
+# sometimes leading to division by zero or other mathematical errors. This is however
+# for financial analysis purposes not an issue and should not be considered as a bug.
+warnings.filterwarnings("ignore", category=RuntimeWarning)
 
 # pylint: disable=too-many-instance-attributes,too-many-lines,line-too-long,too-many-locals
 # pylint: disable=too-many-function-args,too-many-public-methods
@@ -69,21 +80,22 @@ class Toolkit:
 
     def __init__(
         self,
-        tickers: list | str,
+        tickers: list | str | None = None,
         api_key: str = "",
         start_date: str | None = None,
         end_date: str | None = None,
         quarterly: bool = False,
+        use_cached_data: bool | str = False,
         risk_free_rate: str = "10y",
         benchmark_ticker: str | None = "SPY",
-        historical_source: str | None = None,
+        enforce_source: str | None = None,
         historical: pd.DataFrame = pd.DataFrame(),
         balance: pd.DataFrame = pd.DataFrame(),
         income: pd.DataFrame = pd.DataFrame(),
         cash: pd.DataFrame = pd.DataFrame(),
         format_location: str = "",
         convert_currency: bool | None = None,
-        reverse_dates: bool = False,
+        reverse_dates: bool = True,
         intraday_period: str | None = None,
         rounding: int | None = 4,
         remove_invalid_tickers: bool = False,
@@ -91,60 +103,57 @@ class Toolkit:
         progress_bar: bool = True,
     ):
         """
-        Initializes an Toolkit object with a ticker or a list of tickers. The way the Toolkit is initialized
+        Initializes a Toolkit object with a ticker or a list of tickers. The way the Toolkit is initialized
         will define how the data is collected. For example, if you enable the quarterly flag, you will
         be able to collect quarterly data. Next to that, you can define the start and end date to specify
-        a specific range. Another option is to define the custom ratios you want to calculate.
-        This can be done by passing a dictionary.
+        a specific range. Another option is to work with cached data. This is useful when you have collected
+        data before and want to use this data again. This can be done by setting the use_cached_data variable
+        to True. If you want to use a specific location to store the cached data, you can define this as a string,
+        e.g. "datasets".
 
-        See for more information on all of this, the following link: https://www.jeroenbouma.com/projects/financetoolkit
+        It is good to note that the Finance Toolkit will always attempt to acquire data from Financial Modeling Prep
+        if an API key is set. If this isn't the case, the data comes from Yahoo Finance. In case you have an API key
+        set and the current plan doesn't allow for the data to be collected, the Toolkit will automatically switch to
+        Yahoo Finance. You can disable this behaviour by setting the enforce_source variable to "FinancialModelingPrep".
+
+        For more information on the capabilities of the Finance Toolkit see here: https://www.jeroenbouma.com/projects/financetoolkit
 
         Args:
-
-        tickers (str or list): A string or a list of strings containing the company ticker(s). E.g. 'TSLA' or 'MSFT'
-        Find the tickers on a variety of websites or via the FinanceDatabase: https://github.com/JerBouma/financedatabase
-        api_key (str): An API key from FinancialModelingPrep. Obtain one here: https://www.jeroenbouma.com/fmp
-        start_date (str): A string containing the start date of the data. This needs to be formatted as YYYY-MM-DD.
-            The default is today minus 10 years which can be freely changed to extend the period.
-        end_date (str): A string containing the end date of the data. This needs to be formatted as YYYY-MM-DD.
-            The default is today which can be freely changed to extend the period.
-        quarterly (bool): A boolean indicating whether to collect quarterly data. This defaults to False and thus
-        collects yearly financial statements. Note that historical data can still be collected for
-        any period and interval.
-        risk_free_rate (str): A string containing the risk free rate. This can be 13w, 5y, 10y or 30y. This is
-        based on the US Treasury Yields and is used to calculate various ratios and Excess Returns.
-        benchmark_ticker (str): A string containing the benchmark ticker. Defaults to SPY (S&P 500). This is
-        meant to calculate ratios and indicators such as the CAPM and Jensen's Alpha but also serves as purpose to
-        give insights in the performance of a stock compared to a benchmark.
-        historical_source (str): A string containing the historical source. This can be either FinancialModelingPrep
-        or YahooFinance. Defaults to FinancialModelingPrep. It is automatically defined if you enter an API Key from
-        FinancialModelingPrep. You can overwrite this by filling this parameter. Note that for the Free plan the amount
-        of historical data is limited to 5 years. If you want to collect more data, you need to upgrade to a paid plan.
-        historical (pd.DataFrame): A DataFrame containing historical data. This is a custom dataset only relevant if
-        you are looking to use custom data. See for more information the following Notebook:
-        https://www.jeroenbouma.com/projects/financetoolkit/external-datasets
-        balance (pd.DataFrame): A DataFrame containing balance sheet data. This is a custom dataset only
-        relevant if you are looking to use custom data. See for more information the notebook as mentioned at historical.
-        cash (pd.DataFrame): A DataFrame containing cash flow statement data. This is a custom dataset only
-        relevant if you are looking to use custom data. See for more information the notebook as mentioned at historical.
-        format_location (str): A string containing the location of the normalization files.
-        convert_currency (bool): A boolean indicating whether to convert the currency of the financial statements to
-        match that of the related historical data. This is an important conversion when comparing the financial
-        statements between each ticker as well as for calculations that are done with the historical data.
-        If you are using a Free plan from FinancialModelingPrep, this will be set to False.
-        If you are using a Premium plan from FinancialModelingPrep, this will be set to True. Defaults to None
-        and can thus be overridden.
-        reverse_dates (bool): A boolean indicating whether to reverse the dates in the financial statements.
-        intraday_period (str): A string containing the intraday period. This can be 1min, 5min, 15min, 30min or 1hour.
-        This is used to collect intraday data. Note that this is only relevant if you have are looking to utilize
-        intraday data through the Toolkit and wish to access Risk, Performance and Technicals for very short
-        timeframes. Defaults to None which means it will not use intraday data.
-        rounding (int): An integer indicating the number of decimals to round the results to.
-        remove_invalid_tickers (bool): A boolean indicating whether to remove invalid tickers. Defaults to False.
-        sleep_timer (bool): Whether to set a sleep timer when the rate limit is reached. Note that this only works
-        if you have a Premium subscription (Starter or higher) from FinancialModelingPrep. Defaults to None which
-        means it is determined by the model (Free plan = False, Premium plan = True).
-        progress_bar (bool): Whether to enable the progress bar when ticker amount is over 10. Defaults to True.
+            tickers (list | str | None): A string or a list of strings containing the company ticker(s). E.g. 'TSLA' or 'MSFT'.
+            Find tickers on various websites or via the FinanceDatabase: https://github.com/JerBouma/financedatabase. Defaults to None.
+            api_key (str): An API key from FinancialModelingPrep. Obtain one here: https://www.jeroenbouma.com/fmp. Defaults to "".
+            start_date (str | None): A string containing the start date of the data. Needs to be formatted as YYYY-MM-DD.
+            Defaults to 5 years/quarters back from today depending on the 'quarterly' flag.
+            end_date (str | None): A string containing the end date of the data. Needs to be formatted as YYYY-MM-DD.
+            Defaults to today.
+            quarterly (bool): A boolean indicating whether to collect quarterly data. Defaults to False (yearly).
+            Note that historical data can still be collected for any period and interval.
+            use_cached_data (bool | str): A boolean indicating whether to use cached data. If True, uses a 'cached' folder.
+            If a string is provided, uses that string as the path to the cache folder. Defaults to False.
+            risk_free_rate (str): The risk-free rate identifier ('13w', '5y', '10y', '30y'). Based on US Treasury Yields.
+            Used for calculations like Excess Returns. Defaults to "10y".
+            benchmark_ticker (str | None): The benchmark ticker (e.g., 'SPY' for S&P 500). Used for comparative analysis
+            (CAPM, Alpha, Beta). Defaults to "SPY". Set to None to disable benchmark comparison.
+            enforce_source (str | None): Enforce data source ('FinancialModelingPrep' or 'YahooFinance').
+            Defaults to None (uses FMP if api_key provided, otherwise YahooFinance, with fallback).
+            historical (pd.DataFrame): Custom historical price data. See notebook:
+            https://www.jeroenbouma.com/projects/financetoolkit/external-datasets. Defaults to an empty DataFrame.
+            balance (pd.DataFrame): Custom balance sheet data. See notebook link above. Defaults to an empty DataFrame.
+            income (pd.DataFrame): Custom income statement data. See notebook link above. Defaults to an empty DataFrame.
+            cash (pd.DataFrame): Custom cash flow statement data. See notebook link above. Defaults to an empty DataFrame.
+            format_location (str): Path to custom normalization files. Defaults to "".
+            convert_currency (bool | None): Convert financial statements currency to match historical data currency.
+            Important for cross-ticker comparison and calculations involving both data types.
+            Defaults to None (True if FMP plan is Premium, False if Free). Can be overridden.
+            reverse_dates (bool): Reverse the order of dates in financial statements (oldest first). Defaults to True.
+            intraday_period (str | None): Intraday data interval ('1min', '5min', '15min', '30min', '1hour').
+            Enables short-term analysis using Risk, Performance, and Technicals modules. Requires FMP Premium.
+            Defaults to None (no intraday data).
+            rounding (int | None): Number of decimal places for results. Defaults to 4.
+            remove_invalid_tickers (bool): Remove tickers that fail data retrieval. Defaults to False.
+            sleep_timer (bool | None): Enable sleep timer on FMP rate limit (requires Premium).
+            Defaults to None (determined by FMP plan: True for Premium, False for Free).
+            progress_bar (bool): Show progress bar for operations involving multiple tickers. Defaults to True.
 
         As an example:
 
@@ -152,77 +161,58 @@ class Toolkit:
         from financetoolkit import Toolkit
 
         # Simple example
-        toolkit = Toolkit(["TSLA", "ASML"], api_key="FINANCIAL_MODELING_PREP_KEY")
+        toolkit = Toolkit(
+            tickers=["TSLA", "ASML"],
+            api_key="FINANCIAL_MODELING_PREP_KEY")
 
         # Obtaining quarterly data
-        toolkit = Toolkit(["AAPL", "GOOGL"], quarterly=True, api_key="FINANCIAL_MODELING_PREP_KEY")
+        toolkit = Toolkit(
+            tickers=["AAPL", "GOOGL"],
+            quarterly=True,
+            api_key="FINANCIAL_MODELING_PREP_KEY")
+
+        # Enforce a specific source
+        toolkit = Toolkit(
+            tickers=["ASML", "BABA"],
+            quarterly=True,
+            enforce_source="YahooFinance")
 
         # Including a start and end date
-        toolkit = Toolkit(["MSFT", "MU"], start_date="2020-01-01", end_date="2023-01-01", quarterly=True, api_key="FINANCIAL_MODELING_PREP_KEY")
+        toolkit = Toolkit(
+            tickers=["MSFT", "MU"],
+            start_date="2020-01-01",
+            end_date="2023-01-01",
+            quarterly=True,
+            api_key="FINANCIAL_MODELING_PREP_KEY")
+
+        # Working with cached data
+        toolkit = Toolkit(
+            tickers=["WMT", "AAPL"],
+            quarterly=True,
+            api_key="FINANCIAL_MODELING_PREP_KEY",
+            use_cached_data=True)
 
         # Changing the benchmark and risk free rate
-        toolkit = Toolkit("AMZN", benchmark_ticker="^DJI", risk_free_rate="30y", api_key="FINANCIAL_MODELING_PREP_KEY")
+        toolkit = Toolkit(
+            tickers="AMZN",
+            benchmark_ticker="^DJI",
+            risk_free_rate="30y",
+            api_key="FINANCIAL_MODELING_PREP_KEY")
         ```
         """
-        if sleep_timer is None:
-            # This tests the API key to determine the subscription plan. This is relevant for the sleep timer
-            # but also for other components of the Toolkit. This prevents wait timers from occurring while
-            # it wouldn't result to any other answer than a rate limit error.
-            determine_plan = helpers.get_financial_data(
-                url=f"https://financialmodelingprep.com/api/v3/income-statement/AAPL?period=quarter&apikey={api_key}",
-                sleep_timer=False,
-            )
+        self._api_key = api_key
+        self._risk_free_rate = risk_free_rate
+        self._rounding = rounding
+        self._remove_invalid_tickers = remove_invalid_tickers
+        self._invalid_tickers: list = []
 
-            self._fmp_plan = "Premium"
-
-            for option in ["NOT AVAILABLE", "LIMIT REACH", "INVALID API KEY"]:
-                if option in determine_plan:
-                    self._fmp_plan = "Free"
-                    break
-        else:
-            self._fmp_plan = "Premium"
-
-        if isinstance(tickers, str):
-            tickers = [tickers.upper()]
-        elif isinstance(tickers, list):
-            tickers = [ticker.upper() for ticker in tickers]
-        else:
-            raise TypeError("Tickers must be a string or a list of strings.")
-
-        self._tickers: list[str] = []
-        for ticker in tickers:
-            if bool(re.match("^([A-Z]{2})([A-Z0-9]{9})([0-9])$", ticker)):
-                response = requests.get(
-                    f"https://query2.finance.yahoo.com/v1/finance/search?q={ticker}",
-                    timeout=60,
-                    headers={
-                        "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit"
-                        "/537.36 (KHTML, like Gecko) Chrome/108.0.0.0 Safari/537.36"
-                    },
-                )
-
-                if response.status_code == 200:  # noqa
-                    data = response.json()
-
-                    try:
-                        print(f"Converted {ticker} to {data['quotes'][0]['symbol']}")
-                        self._tickers.append(data["quotes"][0]["symbol"])
-                    except (KeyError, ValueError, IndexError):
-                        print(f"Could not convert {ticker}")
-                else:
-                    print(f"Could not convert {ticker}")
-            else:
-                self._tickers.append(ticker)
-
+        self._use_cached_data = (
+            use_cached_data if isinstance(use_cached_data, bool) else True
+        )
+        self._cached_data_location = (
+            "cached" if isinstance(use_cached_data, bool) else use_cached_data
+        )
         self._benchmark_ticker = benchmark_ticker
-
-        if self._benchmark_ticker in self._tickers:
-            print(
-                f"Please note that the benchmark ticker ({self._benchmark_ticker}) is also "
-                "included in the tickers. Therefore, this ticker will be removed from the "
-                "tickers list."
-            )
-            self._tickers.remove(self._benchmark_ticker)
 
         if start_date and re.match(r"^\d{4}-\d{2}-\d{2}$", start_date) is None:
             raise ValueError(
@@ -247,30 +237,218 @@ class Toolkit:
                 "Please select a valid risk free rate (13w, 5y, 10y or 30y)"
             )
 
-        self._api_key = api_key
         self._start_date = (
             start_date
             if start_date
-            else (datetime.now() - timedelta(days=365 * 10)).strftime("%Y-%m-%d")
+            else (
+                datetime.now() - timedelta(days=90 * 5 if quarterly else 365 * 5)
+            ).strftime("%Y-%m-%d")
         )
         self._end_date = end_date if end_date else datetime.now().strftime("%Y-%m-%d")
         self._quarterly = quarterly
-        self._risk_free_rate = risk_free_rate
-        self._rounding = rounding
-        self._remove_invalid_tickers = remove_invalid_tickers
-        self._invalid_tickers: list = []
+
+        if use_cached_data:
+            cached_configurations = cache_model.load_cached_data(
+                cached_data_location=self._cached_data_location,
+                file_name="configurations.pickle",
+                method="pickle",
+            )
+
+            if cached_configurations:  # Check if dictionary is not empty
+                cached_overwrites = []
+                # Map cache keys to tuples of (initial_value, attribute_name)
+                config_mapping = {
+                    "start_date": (self._start_date, "_start_date"),
+                    "end_date": (self._end_date, "_end_date"),
+                    "quarterly": (self._quarterly, "_quarterly"),
+                    "benchmark_ticker": (self._benchmark_ticker, "_benchmark_ticker"),
+                    "risk_free_rate": (self._risk_free_rate, "_risk_free_rate"),
+                }
+
+                # Compare initial values with cached values, update instance if different
+                for key, (initial_value, attr_name) in config_mapping.items():
+                    cached_value = cached_configurations.get(key)
+                    # Check if cached value exists and is different from the initial value
+                    if cached_value is not None and initial_value != cached_value:
+                        setattr(
+                            self, attr_name, cached_value
+                        )  # Update instance attribute
+                        cached_overwrites.append(f"{key} ({cached_value})")
+
+                # Handle tickers separately: compare input tickers with cached tickers
+                cached_tickers = cached_configurations.get("tickers")
+                # Check if cached tickers exist and are different from the input tickers
+                if cached_tickers is not None and tickers != cached_tickers and tickers:
+                    # Only log the change if the user actually provided tickers initially
+                    cached_overwrites.append("tickers")
+                    tickers = cached_tickers
+
+                if cached_overwrites:
+                    folder = (
+                        "cached"
+                        if isinstance(use_cached_data, bool)
+                        else use_cached_data
+                    )
+                    logger.info(
+                        "The following variables are overwritten by the cached "
+                        "configurations: %s\n"
+                        "If this is undesirable, please set the use_cached_data variable "
+                        "to False, delete the directory %s or select a new "
+                        "location for the cached data by changing the use_cached_data "
+                        "variable to a string.",
+                        ", ".join(cached_overwrites),
+                        folder,
+                    )
+            else:
+                # Save the current configuration if no cache exists
+                # Use the values as they are before potential overwrites from cache
+                cache_model.save_cached_data(
+                    cached_data={
+                        "tickers": tickers,  # Use the initial tickers list/str
+                        "start_date": self._start_date,
+                        "end_date": self._end_date,
+                        "quarterly": self._quarterly,
+                        "benchmark_ticker": self._benchmark_ticker,
+                        "risk_free_rate": self._risk_free_rate,  # Use the initial risk_free_rate
+                    },
+                    cached_data_location=self._cached_data_location,
+                    file_name="configurations.pickle",
+                    method="pickle",
+                    include_message=False,
+                )
+
+        if isinstance(tickers, str):
+            tickers = [tickers.upper()]
+        elif isinstance(tickers, list):
+            tickers = [
+                ticker.upper() if ticker != "Portfolio" else ticker
+                for ticker in tickers
+            ]
+        elif tickers is None:
+            raise ValueError("Please input a ticker or a list of tickers.")
+        else:
+            raise TypeError("Tickers must be a string or a list of strings.")
+
+        self._tickers: list[str] = []
+
+        for ticker in tickers:
+            # Check whether the ticker is in ISIN format and if say so convert it to a ticker
+            self._tickers.append(helpers.convert_isin_to_ticker(ticker))
+
+        # Take out duplicate tickers if applicable
+        deduplicated_tickers = list(set(self._tickers))
+
+        if len(deduplicated_tickers) != len(self._tickers):
+            duplicate_tickers = [
+                ticker for ticker, count in Counter(self._tickers).items() if count > 1
+            ]
+            logger.warning(
+                "Found duplicate tickers, duplicate entries of the following tickers are removed: %s",
+                ", ".join(duplicate_tickers),
+            )
+            self._tickers = deduplicated_tickers
+
+        if self._benchmark_ticker in self._tickers:
+            logger.warning(
+                "Please note that the benchmark ticker (%s) is also "
+                "included in the tickers. Therefore, this ticker will be removed from the "
+                "tickers list. If this is not desired, please set the benchmark_ticker to None.",
+                self._benchmark_ticker,
+            )
+            self._tickers.remove(self._benchmark_ticker)
+
+        self._enforce_source: str | None = enforce_source
+
+        if self._enforce_source not in [None, "FinancialModelingPrep", "YahooFinance"]:
+            raise ValueError(
+                "Please select either FinancialModelingPrep or YahooFinance as the "
+                "enforced source."
+            )
+        if self._enforce_source == "FinancialModelingPrep" and not self._api_key:
+            raise ValueError(
+                "Please input an API key from FinancialModelingPrep if you wish to use "
+                "historical data from FinancialModelingPrep."
+            )
+
+        if sleep_timer is None:
+            # This tests the API key to determine the subscription plan. This is relevant for the sleep timer
+            # but also for other components of the Toolkit. This prevents wait timers from occurring while
+            # it wouldn't result to any other answer than a rate limit error.
+            determine_plan = _get_financial_data(
+                url=f"https://financialmodelingprep.com/stable/income-statement?symbol=AAPL&apikey={api_key}&limit=10",
+                sleep_timer=False,
+                user_subscription="Free",
+            )
+
+            self._fmp_plan = "Premium"
+
+            for option in [
+                "PREMIUM QUERY PARAMETER",
+                "EXCLUSIVE ENDPOINT",
+                "NO DATA",
+                "BANDWIDTH LIMIT REACH",
+                "INVALID API KEY",
+                "LIMIT REACH",
+            ]:
+                if option in determine_plan:
+                    if option == "INVALID API KEY" and api_key:
+                        self._enforce_source = "YahooFinance"
+                        logger.error(
+                            "You have entered an invalid API key from Financial Modeling Prep. Obtain your API key for free "
+                            "and get 15%% off the Premium plans by using the following affiliate link.\nThis also supports "
+                            "the project: https://www.jeroenbouma.com/fmp. Using Yahoo Finance as data source instead."
+                        )
+                    self._fmp_plan = "Free"
+                    break
+        else:
+            self._fmp_plan = "Premium"
+
         self._sleep_timer = (
             sleep_timer if sleep_timer is not None else self._fmp_plan != "Free"
         )
-        self._convert_currency = (
-            convert_currency
-            if convert_currency is not None
-            else self._fmp_plan != "Free"
-        )
+
         self._progress_bar = progress_bar
-        self._historical = historical
-        self._currencies: list = []
-        self._statement_currencies: pd.Series = pd.Series()
+
+        if self._api_key or self._use_cached_data:
+            # Initialize attributes to empty DataFrames
+            self._profile: pd.DataFrame = pd.DataFrame()
+            self._quote: pd.DataFrame = pd.DataFrame()
+            self._rating: pd.DataFrame = pd.DataFrame()
+            self._analyst_estimates: pd.DataFrame = pd.DataFrame()
+            self._analyst_estimates_growth: pd.DataFrame = pd.DataFrame()
+            self._dividend_calendar: pd.DataFrame = pd.DataFrame()
+            self._earnings_calendar: pd.DataFrame = pd.DataFrame()
+            self._esg_scores: pd.DataFrame = pd.DataFrame()
+            self._revenue_geographic_segmentation: pd.DataFrame = pd.DataFrame()
+            self._revenue_product_segmentation: pd.DataFrame = pd.DataFrame()
+            self._revenue_geographic_segmentation_growth: pd.DataFrame = pd.DataFrame()
+            self._revenue_product_segmentation_growth: pd.DataFrame = pd.DataFrame()
+
+            # Define attributes and their corresponding cache file names
+            cached_attributes = {
+                "_profile": "profile.pickle",
+                "_quote": "quote.pickle",
+                "_rating": "rating.pickle",
+                "_analyst_estimates": "analyst_estimates.pickle",
+                "_analyst_estimates_growth": "analyst_estimates_growth.pickle",
+                "_dividend_calendar": "dividend_calendar.pickle",
+                "_earnings_calendar": "earnings_calendar.pickle",
+                "_esg_scores": "esg_scores.pickle",
+                "_revenue_geographic_segmentation": "revenue_geographic_segmentation.pickle",
+                "_revenue_product_segmentation": "revenue_product_segmentation.pickle",
+            }
+
+            # Initialize FinancialModelingPrep Variables
+            for attr_name, file_name in cached_attributes.items():
+                data = (
+                    cache_model.load_cached_data(
+                        cached_data_location=self._cached_data_location,
+                        file_name=file_name,
+                    )
+                    if self._use_cached_data
+                    else pd.DataFrame()
+                )
+                setattr(self, attr_name, data)
 
         if intraday_period and intraday_period not in [
             "1min",
@@ -285,83 +463,77 @@ class Toolkit:
 
         self._intraday_period = intraday_period
 
-        if self._api_key:
-            # Initialization of FinancialModelingPrep Variables
-            self._profile: pd.DataFrame = pd.DataFrame()
-            self._quote: pd.DataFrame = pd.DataFrame()
-            self._rating: pd.DataFrame = pd.DataFrame()
-            self._analyst_estimates: pd.DataFrame = pd.DataFrame()
-            self._analyst_estimates_growth: pd.DataFrame = pd.DataFrame()
-            self._dividend_calendar: pd.DataFrame = pd.DataFrame()
-            self._earnings_calendar: pd.DataFrame = pd.DataFrame()
-            self._esg_scores: pd.DataFrame = pd.DataFrame()
-            self._revenue_geographic_segmentation: pd.DataFrame = pd.DataFrame()
-            self._revenue_geographic_segmentation_growth: pd.DataFrame = pd.DataFrame()
-            self._revenue_product_segmentation: pd.DataFrame = pd.DataFrame()
-            self._revenue_product_segmentation_growth: pd.DataFrame = pd.DataFrame()
-            self._historical_source = (
-                historical_source if historical_source else "FinancialModelingPrep"
+        # Load intraday data from cache if specified, otherwise initialize empty DataFrame
+        self._intraday_historical_data: pd.DataFrame = (
+            cache_model.load_cached_data(
+                cached_data_location=self._cached_data_location,
+                file_name="intraday_historical_data.pickle",
             )
-        else:
-            self._historical_source = (
-                historical_source if historical_source else "YahooFinance"
-            )
+            if self._use_cached_data
+            else pd.DataFrame()
+        )
 
-        if self._historical_source not in ["FinancialModelingPrep", "YahooFinance"]:
-            raise ValueError(
-                "Please select either FinancialModelingPrep or YahooFinance as the "
-                "historical source."
-            )
-        if self._historical_source == "FinancialModelingPrep" and not self._api_key:
-            raise ValueError(
-                "Please input an API key from FinancialModelingPrep if you wish to use "
-                "historical data from FinancialModelingPrep."
-            )
+        # Use provided historical data if available, otherwise load daily data from cache or initialize empty DataFrame
+        self._historical = historical
 
-        # Initialization of Historical Variables
-        self._intraday_historical_data: pd.DataFrame = pd.DataFrame()
         self._daily_historical_data: pd.DataFrame = (
-            historical if not historical.empty else pd.DataFrame()
-        )
-        self._weekly_historical_data: pd.DataFrame = (
-            _convert_daily_to_other_period(
-                "weekly",
-                self._daily_historical_data,
-                self._start_date,
-                self._end_date,
-            )
+            historical
             if not historical.empty
-            else pd.DataFrame()
-        )
-        self._monthly_historical_data: pd.DataFrame = (
-            _convert_daily_to_other_period(
-                "monthly",
-                self._daily_historical_data,
-                self._start_date,
-                self._end_date,
+            else (
+                cache_model.load_cached_data(
+                    cached_data_location=self._cached_data_location,
+                    file_name="daily_historical_data.pickle",
+                )
+                if self._use_cached_data
+                else pd.DataFrame()
             )
-            if not historical.empty
-            else pd.DataFrame()
-        )
-        self._quarterly_historical_data: pd.DataFrame = (
-            _convert_daily_to_other_period(
-                "quarterly",
-                self._daily_historical_data,
-                self._start_date,
-                self._end_date,
-            )
-            if not historical.empty
-            else pd.DataFrame()
-        )
-        self._yearly_historical_data: pd.DataFrame = (
-            _convert_daily_to_other_period(
-                "yearly", self._daily_historical_data, self._start_date, self._end_date
-            )
-            if not historical.empty
-            else pd.DataFrame()
         )
 
+        # Initialize other periods as empty DataFrames. They will be populated on demand.
+        self._weekly_historical_data: pd.DataFrame = pd.DataFrame()
+        self._monthly_historical_data: pd.DataFrame = pd.DataFrame()
+        self._quarterly_historical_data: pd.DataFrame = pd.DataFrame()
+        self._yearly_historical_data: pd.DataFrame = pd.DataFrame()
         self._historical_statistics: pd.DataFrame = pd.DataFrame()
+
+        # Initialization of the Financial Statements and Normalization
+        self._reverse_dates = reverse_dates
+
+        (
+            self._balance_sheet_statement,
+            self._income_statement,
+            self._cash_flow_statement,
+            self._statistics_statement,
+            self._fmp_balance_sheet_statement_generic,
+            self._yf_balance_sheet_statement_generic,
+            self._fmp_income_statement_generic,
+            self._yf_income_statement_generic,
+            self._fmp_cash_flow_statement_generic,
+            self._yf_cash_flow_statement_generic,
+            self._fmp_statistics_statement_generic,
+        ) = _initialize_statements_and_normalization(
+            balance=balance,
+            income=income,
+            cash=cash,
+            format_location=format_location,
+            reverse_dates=self._reverse_dates,
+            use_cached_data=use_cached_data,
+            cached_data_location=self._cached_data_location,
+            start_date=self._start_date,
+            end_date=self._end_date,
+            quarterly=self._quarterly,
+        )
+
+        self._balance_sheet_statement_growth: pd.DataFrame = pd.DataFrame()
+        self._income_statement_growth: pd.DataFrame = pd.DataFrame()
+        self._cash_flow_statement_growth: pd.DataFrame = pd.DataFrame()
+        self._currencies: list = []
+        self._statement_currencies: pd.Series = pd.Series()
+        self._convert_currency = (
+            convert_currency
+            if convert_currency is not None
+            else self._fmp_plan != "Free"
+        )
 
         # Initialization of Risk Free Rate
         self._daily_risk_free_rate: pd.DataFrame = pd.DataFrame()
@@ -384,65 +556,8 @@ class Toolkit:
         self._quarterly_exchange_rate_data: pd.DataFrame = pd.DataFrame()
         self._yearly_exchange_rate_data: pd.DataFrame = pd.DataFrame()
 
-        # Initialization of Normalization Variables
-        self._balance_sheet_statement_generic: pd.DataFrame = _read_normalization_file(
-            "balance", format_location
-        )
-        self._income_statement_generic: pd.DataFrame = _read_normalization_file(
-            "income", format_location
-        )
-        self._cash_flow_statement_generic: pd.DataFrame = _read_normalization_file(
-            "cash", format_location
-        )
-
-        self._statistics_statement_generic: pd.DataFrame = _read_normalization_file(
-            "statistics", format_location
-        )
-
-        # Initialization of Financial Statements
-        self._balance_sheet_statement: pd.DataFrame = (
-            _convert_date_label(
-                _convert_financial_statements(
-                    balance, self._balance_sheet_statement_generic, reverse_dates
-                ),
-                self._start_date,
-                self._end_date,
-                self._quarterly,
-            )
-            if not balance.empty
-            else pd.DataFrame()
-        )
-        self._balance_sheet_statement_growth: pd.DataFrame = pd.DataFrame()
-
-        self._income_statement: pd.DataFrame = (
-            _convert_date_label(
-                _convert_financial_statements(
-                    income, self._income_statement_generic, reverse_dates
-                ),
-                self._start_date,
-                self._end_date,
-                self._quarterly,
-            )
-            if not income.empty
-            else pd.DataFrame()
-        )
-        self._income_statement_growth: pd.DataFrame = pd.DataFrame()
-
-        self._cash_flow_statement: pd.DataFrame = (
-            _convert_date_label(
-                _convert_financial_statements(
-                    cash, self._cash_flow_statement_generic, reverse_dates
-                ),
-                self._start_date,
-                self._end_date,
-                self._quarterly,
-            )
-            if not cash.empty
-            else pd.DataFrame()
-        )
-        self._cash_flow_statement_growth: pd.DataFrame = pd.DataFrame()
-
-        self._statistics_statement: pd.DataFrame = pd.DataFrame()
+        # Initialization of the Portfolio Variables
+        self._portfolio_weights: dict | None = None
 
         pd.set_option("display.float_format", str)
 
@@ -499,14 +614,18 @@ class Toolkit:
         """
         empty_data: list = []
 
-        if not self._api_key and (
-            self._balance_sheet_statement.empty
-            or self._income_statement.empty
-            or self._cash_flow_statement.empty
+        if (
+            not self._api_key
+            and (
+                self._balance_sheet_statement.empty
+                or self._income_statement.empty
+                or self._cash_flow_statement.empty
+            )
+            and self._enforce_source == "FinancialModelingPrep"
         ):
             raise ValueError(
-                "The ratios class requires an API key from FinancialModelPrep. "
-                "Get an API key here: https://www.jeroenbouma.com/fmp"
+                "The ratios class requires an API key from FinancialModelPrep if you wish to enforce the usage. "
+                "of Financial Modeling Prep. Get an API key here: https://www.jeroenbouma.com/fmp"
             )
 
         if self._balance_sheet_statement.empty:
@@ -538,7 +657,8 @@ class Toolkit:
         ):
             raise ValueError(
                 "The datasets could not be populated and therefore the Ratios class cannot be initialized. "
-                "This is usually because you have reached the API limit or entered an invalid API key."
+                "This is usually because no tickers are equities, you have reached the API limit or "
+                "entered an invalid API key."
             )
 
         if not self._start_date:
@@ -555,23 +675,35 @@ class Toolkit:
         else:
             self.get_historical_data(period="yearly")
 
-        tickers = (
-            self._balance_sheet_statement.index.get_level_values(0).unique().tolist()
-        )
-
-        return Ratios(
-            tickers=tickers,
-            historical=(
+        historical = {
+            "period": (
                 self._quarterly_historical_data
                 if self._quarterly
                 else self._yearly_historical_data
             ),
+            "daily": self._daily_historical_data,
+        }
+
+        tickers = (
+            self._balance_sheet_statement.index.get_level_values(0).unique().tolist()
+        )
+
+        ratios = Ratios(
+            tickers=(
+                tickers + ["Portfolio"] if "Portfolio" in self._tickers else tickers
+            ),
+            historical=historical,
             balance=self._balance_sheet_statement,
             income=self._income_statement,
             cash=self._cash_flow_statement,
             quarterly=self._quarterly,
             rounding=self._rounding,
         )
+
+        if self._portfolio_weights:
+            ratios._portfolio_weights = self._portfolio_weights
+
+        return ratios
 
     @property
     def models(self) -> Models:
@@ -646,7 +778,8 @@ class Toolkit:
         ):
             raise ValueError(
                 "The datasets could not be populated and therefore the Ratios class cannot be initialized. "
-                "This is usually because you have reached the API limit or entered an invalid API key."
+                "This is usually because no tickers are equities, you have reached the API limit or "
+                "entered an invalid API key."
             )
 
         if not self._start_date:
@@ -833,13 +966,20 @@ class Toolkit:
             "yearly": self._yearly_historical_data,
         }
 
-        return Technicals(
-            tickers=tickers,
+        technicals = Technicals(
+            tickers=(
+                tickers + ["Portfolio"] if "Portfolio" in self._tickers else tickers
+            ),
             historical_data=historical_data,
             rounding=self._rounding,
             start_date=self._start_date,
             end_date=self._end_date,
         )
+
+        if self._portfolio_weights:
+            technicals._portfolio_weights = self._portfolio_weights
+
+        return technicals
 
     @property
     def performance(self) -> Performance:
@@ -916,8 +1056,10 @@ class Toolkit:
         if "Benchmark" in tickers:
             tickers.remove("Benchmark")
 
-        return Performance(
-            tickers=tickers,
+        performance = Performance(
+            tickers=(
+                tickers + ["Portfolio"] if "Portfolio" in self._tickers else tickers
+            ),
             historical_data=historical_data,
             risk_free_rate_data=risk_free_rate_data,
             quarterly=self._quarterly,
@@ -927,6 +1069,11 @@ class Toolkit:
             intraday_period=self._intraday_period,
             progress_bar=self._progress_bar,
         )
+
+        if self._portfolio_weights:
+            performance._portfolio_weights = self._portfolio_weights
+
+        return performance
 
     @property
     def risk(self) -> Risk:
@@ -998,13 +1145,20 @@ class Toolkit:
             "yearly": self._yearly_historical_data,
         }
 
-        return Risk(
-            tickers=tickers,
+        risk = Risk(
+            tickers=(
+                tickers + ["Portfolio"] if "Portfolio" in self._tickers else tickers
+            ),
             historical_data=historical_data,
             intraday_period=self._intraday_period,
             quarterly=self._quarterly,
             rounding=self._rounding,
         )
+
+        if self._portfolio_weights:
+            risk._portfolio_weights = self._portfolio_weights
+
+        return risk
 
     @property
     def fixedincome(self) -> FixedIncome:
@@ -1159,7 +1313,7 @@ class Toolkit:
         | IPO Date              | 1986-03-13                | 1980-12-12            |
         """
         if not self._api_key:
-            return print(
+            logger.error(
                 "The requested data requires the api_key parameter to be set, consider "
                 "obtaining a key with the following link: "
                 "https://www.jeroenbouma.com/fmp"
@@ -1167,6 +1321,7 @@ class Toolkit:
                 "quarterly data. Consider upgrading your plan. You can get 15% off by using the "
                 "above affiliate link which also supports the project."
             )
+            return None
 
         if self._profile.empty:
             self._profile, self._invalid_tickers = _get_profile(
@@ -1175,7 +1330,15 @@ class Toolkit:
                 progress_bar=(
                     progress_bar if progress_bar is not None else self._progress_bar
                 ),
+                user_subscription=self._fmp_plan,
             )
+
+            if self._use_cached_data:
+                cache_model.save_cached_data(
+                    cached_data=self._profile,
+                    cached_data_location=self._cached_data_location,
+                    file_name="profile.pickle",
+                )
 
         if self._remove_invalid_tickers:
             self._tickers = [
@@ -1236,7 +1399,7 @@ class Toolkit:
         | Timestamp              | 2023-08-18 20:00:00          | 2023-08-18 20:00:01          |
         """
         if not self._api_key:
-            return print(
+            logger.error(
                 "The requested data requires the api_key parameter to be set, consider "
                 "obtaining a key with the following link: "
                 "https://www.jeroenbouma.com/fmp"
@@ -1244,6 +1407,7 @@ class Toolkit:
                 "quarterly data. Consider upgrading your plan. You can get 15% off by using the "
                 "above affiliate link which also supports the project."
             )
+            return None
 
         if self._quote.empty:
             self._quote, self._invalid_tickers = _get_quote(
@@ -1252,7 +1416,15 @@ class Toolkit:
                 progress_bar=(
                     progress_bar if progress_bar is not None else self._progress_bar
                 ),
+                user_subscription=self._fmp_plan,
             )
+
+            if self._use_cached_data:
+                cache_model.save_cached_data(
+                    cached_data=self._quote,
+                    cached_data_location=self._cached_data_location,
+                    file_name="quote.pickle",
+                )
 
         if self._remove_invalid_tickers:
             self._tickers = [
@@ -1309,7 +1481,7 @@ class Toolkit:
 
         """
         if not self._api_key:
-            return print(
+            logger.error(
                 "The requested data requires the api_key parameter to be set, consider "
                 "obtaining a key with the following link: "
                 "https://www.jeroenbouma.com/fmp"
@@ -1317,6 +1489,7 @@ class Toolkit:
                 "quarterly data. Consider upgrading your plan. You can get 15% off by using the "
                 "above affiliate link which also supports the project."
             )
+            return None
 
         if self._rating.empty:
             self._rating, self._invalid_tickers = _get_rating(
@@ -1325,7 +1498,15 @@ class Toolkit:
                 progress_bar=(
                     progress_bar if progress_bar is not None else self._progress_bar
                 ),
+                user_subscription=self._fmp_plan,
             )
+
+            if self._use_cached_data:
+                cache_model.save_cached_data(
+                    cached_data=self._rating,
+                    cached_data_location=self._cached_data_location,
+                    file_name="rating.pickle",
+                )
 
         if self._remove_invalid_tickers:
             self._tickers = [
@@ -1400,12 +1581,13 @@ class Toolkit:
         | Number of Analysts            | 14           | 16           | 12           | 10           |
         """
         if not self._api_key:
-            return print(
+            logger.error(
                 "The requested data requires the api_key parameter to be set, consider obtaining "
                 "a key with the following link: https://www.jeroenbouma.com/fmp"
                 "\nThis functionality also requires a Premium subscription. You can get 15% off by "
                 "using the above affiliate link which also supports the project."
             )
+            return None
 
         if self._analyst_estimates.empty or overwrite:
             (
@@ -1421,7 +1603,15 @@ class Toolkit:
                 progress_bar=(
                     progress_bar if progress_bar is not None else self._progress_bar
                 ),
+                user_subscription=self._fmp_plan,
             )
+
+            if self._use_cached_data:
+                cache_model.save_cached_data(
+                    cached_data=self._analyst_estimates,
+                    cached_data_location=self._cached_data_location,
+                    file_name="analyst_estimates.pickle",
+                )
 
         if self._remove_invalid_tickers:
             self._tickers = [
@@ -1431,7 +1621,7 @@ class Toolkit:
             ]
 
         if growth:
-            self._analyst_estimates_growth = _calculate_growth(
+            self._analyst_estimates_growth = helpers.calculate_growth(
                 self._analyst_estimates,
                 lag=lag,
                 rounding=rounding if rounding else self._rounding,
@@ -1494,12 +1684,13 @@ class Toolkit:
         | 2024-08-01  | nan    |          nan    | nan           |       nan           | 2024-06-30           | amc    |
         """
         if not self._api_key:
-            return print(
+            logger.error(
                 "The requested data requires the api_key parameter to be set, consider obtaining a key with the "
                 "following link: https://www.jeroenbouma.com/fmp"
                 "\nThis functionality also requires a Premium subscription. You can get 15% off by using "
                 "the above affiliate link which also supports the project."
             )
+            return None
 
         if self._earnings_calendar.empty or overwrite:
             (
@@ -1515,7 +1706,15 @@ class Toolkit:
                 progress_bar=(
                     progress_bar if progress_bar is not None else self._progress_bar
                 ),
+                user_subscription=self._fmp_plan,
             )
+
+            if self._use_cached_data:
+                cache_model.save_cached_data(
+                    cached_data=self._earnings_calendar,
+                    cached_data_location=self._cached_data_location,
+                    file_name="earnings_calendar.pickle",
+                )
 
         earnings_calendar = self._earnings_calendar.round(
             rounding if rounding else self._rounding
@@ -1574,12 +1773,13 @@ class Toolkit:
 
         """
         if not self._api_key:
-            return print(
+            logger.error(
                 "The requested data requires the api_key parameter to be set, consider obtaining a key with the "
                 "following link: https://www.jeroenbouma.com/fmp"
                 "\nThis functionality also requires a Professional or Enterprise subscription. "
                 "You can get 15% off by using the above affiliate link which also supports the project."
             )
+            return None
 
         if self._revenue_geographic_segmentation.empty or overwrite:
             (
@@ -1589,14 +1789,22 @@ class Toolkit:
                 tickers=self._tickers,
                 method="geographic",
                 api_key=self._api_key,
-                quarter=self._quarterly,
+                quarter=self._quarterly if self._fmp_plan == "Premium" else False,
                 start_date=self._start_date,
                 end_date=self._end_date,
                 sleep_timer=self._sleep_timer,
                 progress_bar=(
                     progress_bar if progress_bar is not None else self._progress_bar
                 ),
+                user_subscription=self._fmp_plan,
             )
+
+            if self._use_cached_data:
+                cache_model.save_cached_data(
+                    cached_data=self._revenue_geographic_segmentation,
+                    cached_data_location=self._cached_data_location,
+                    file_name="revenue_geographic_segmentation.pickle",
+                )
 
         if self._remove_invalid_tickers:
             self._tickers = [
@@ -1655,12 +1863,13 @@ class Toolkit:
 
         """
         if not self._api_key:
-            return print(
+            logger.error(
                 "The requested data requires the api_key parameter to be set, consider obtaining a key with the "
                 "following link: https://www.jeroenbouma.com/fmp"
                 "\nThis functionality also requires a Professional or Enterprise subscription. You can get 15% off by using "
                 "the above affiliate link which also supports the project."
             )
+            return None
 
         if self._revenue_product_segmentation.empty or overwrite:
             (
@@ -1670,14 +1879,22 @@ class Toolkit:
                 tickers=self._tickers,
                 method="product",
                 api_key=self._api_key,
-                quarter=self._quarterly,
+                quarter=self._quarterly if self._fmp_plan == "Premium" else False,
                 start_date=self._start_date,
                 end_date=self._end_date,
                 sleep_timer=self._sleep_timer,
                 progress_bar=(
                     progress_bar if progress_bar is not None else self._progress_bar
                 ),
+                user_subscription=self._fmp_plan,
             )
+
+            if self._use_cached_data:
+                cache_model.save_cached_data(
+                    cached_data=self._revenue_product_segmentation,
+                    cached_data_location=self._cached_data_location,
+                    file_name="revenue_product_segmentation.pickle",
+                )
 
         if self._remove_invalid_tickers:
             self._tickers = [
@@ -1693,6 +1910,7 @@ class Toolkit:
 
     def get_historical_data(
         self,
+        enforce_source: str | None = None,
         period: str = "daily",
         return_column: str = "Adj Close",
         include_dividends: bool = True,
@@ -1725,12 +1943,12 @@ class Toolkit:
 
         Important to note is that when an api_key is included in the Toolkit initialization that the data
         collection defaults to FinancialModelingPrep which is a more stable source and utilises your subscription.
-        However, if this is undesired, it can be disabled by setting historical_source to "YahooFinance". If
+        However, if this is undesired, it can be disabled by setting enforce_source to "YahooFinance". If
         data collection fails from FinancialModelingPrep it automatically reverts back to YahooFinance.
 
         Args:
-            start (str): The start date for the historical data. Defaults to None.
-            end (str): The end date for the historical data. Defaults to None.
+            enforce_source (str, optional): A string containing the historical source you wish to enforce.
+            This can be either FinancialModelingPrep or YahooFinance. Defaults to no enforcement.
             period (str): The interval at which the historical data should be
             returned - daily, weekly, monthly, quarterly, or yearly.
             Defaults to "daily".
@@ -1743,8 +1961,6 @@ class Toolkit:
             overwrite (bool): Defines whether to overwrite the existing data. If this is not enabled, the function
             will return the earlier retrieved data. This is done to prevent too many API calls. Defaults to False.
             rounding (int): Defines the number of decimal places to round the data to.
-            sleep_timer (bool): Defines whether to include a sleep timer to prevent
-            overloading the API. Defaults to True.
             show_ticker_seperation (bool, optional): A boolean representing whether to show which tickers
             acquired data from FinancialModelingPrep and which tickers acquired data from YahooFinance.
             progress_bar (bool, optional): Whether to show a progress bar. Defaults to None.
@@ -1781,6 +1997,14 @@ class Toolkit:
         | 2022   | 128.41   | 129.95   | 127.43   | 129.93   |    129.378  | 7.70342e+07 |    0.91     | -0.264042  |     0.356964 |      -0.302832  |            0.377293 |             7.35566 |
         | 2023   | 187.84   | 188.51   | 187.68   | 188.108  |    188.108  | 4.72009e+06 |    0.71     |  0.453941  |     0.213359 |       0.412901  |            0.22327  |            10.6947  |
         """
+        if enforce_source is not None and enforce_source not in [
+            "FinancialModelingPrep",
+            "YahooFinance",
+        ]:
+            raise ValueError(
+                "The enforce_source parameter must be either 'FinancialModelingPrep' or 'YahooFinance'."
+            )
+
         if self._daily_risk_free_rate.empty or overwrite:
             self.get_treasury_data(
                 risk_free_rate=self._risk_free_rate,
@@ -1796,7 +2020,11 @@ class Toolkit:
                     else self._tickers
                 ),
                 api_key=self._api_key,
-                source=self._historical_source,
+                enforce_source=(
+                    enforce_source
+                    if enforce_source is not None
+                    else self._enforce_source
+                ),
                 start=self._start_date,
                 end=self._end_date,
                 interval="1d",
@@ -1817,6 +2045,13 @@ class Toolkit:
             self._daily_historical_data = self._daily_historical_data.rename(
                 columns={self._benchmark_ticker: "Benchmark"}, level=1
             )
+
+            if self._use_cached_data:
+                cache_model.save_cached_data(
+                    cached_data=self._daily_historical_data,
+                    cached_data_location=self._cached_data_location,
+                    file_name="daily_historical_data.pickle",
+                )
 
         if self._remove_invalid_tickers:
             self._tickers = [
@@ -2016,12 +2251,13 @@ class Toolkit:
         | 2024-01-19 15:59 | 398.35 | 398.66 | 398.22  | 398.66  |   586344 |   0.0008 |       0.0005 |              1.0286 |
         """
         if not self._api_key:
-            return print(
+            logger.error(
                 "The requested data requires the api_key parameter to be set, consider obtaining a key with the "
                 "following link: https://www.jeroenbouma.com/fmp"
                 "\nThis functionality also requires a Professional or Enterprise subscription. You can get 15% off by using "
                 "the above affiliate link which also supports the project."
             )
+            return None
 
         if period not in ["1min", "5min", "15min", "30min", "1hour"]:
             raise ValueError(
@@ -2039,7 +2275,7 @@ class Toolkit:
                     else self._tickers
                 ),
                 api_key=self._api_key,
-                source=self._historical_source,
+                enforce_source=None,
                 start=self._start_date,
                 end=self._end_date,
                 interval=period,
@@ -2055,6 +2291,13 @@ class Toolkit:
                 show_errors=True,
                 tqdm_message="Obtaining intraday data",
             )
+
+            if self._use_cached_data:
+                cache_model.save_cached_data(
+                    cached_data=self._intraday_historical_data,
+                    cached_data_location=self._cached_data_location,
+                    file_name="intraday_historical_data.pickle",
+                )
 
         # Save the period to prevent having to reacquire the data
         self._intraday_period = period
@@ -2133,12 +2376,13 @@ class Toolkit:
         | 2023-08-11 |           0.24 |       0.24 | 2023-08-14    | 2023-08-17     | 2023-08-03         |
         """
         if not self._api_key:
-            return print(
+            logger.error(
                 "The requested data requires the api_key parameter to be set, consider obtaining a key with the "
                 "following link: https://www.jeroenbouma.com/fmp"
                 "\nThis functionality also requires a Premium subscription. You can get 15% off by using "
                 "the above affiliate link which also supports the project."
             )
+            return None
 
         if self._dividend_calendar.empty or overwrite:
             (
@@ -2153,7 +2397,15 @@ class Toolkit:
                 progress_bar=(
                     progress_bar if progress_bar is not None else self._progress_bar
                 ),
+                user_subscription=self._fmp_plan,
             )
+
+            if self._use_cached_data:
+                cache_model.save_cached_data(
+                    cached_data=self._dividend_calendar,
+                    cached_data_location=self._cached_data_location,
+                    file_name="dividend_calendar.pickle",
+                )
 
         dividend_calendar = self._dividend_calendar.round(
             rounding if rounding else self._rounding
@@ -2240,12 +2492,13 @@ class Toolkit:
         | 2023Q2 |                 73.54 |          60.73 |              63.44 |       65.9  |
         """
         if not self._api_key:
-            return print(
+            logger.error(
                 "The requested data requires the api_key parameter to be set, consider obtaining a key with the "
                 "following link: https://www.jeroenbouma.com/fmp"
                 "\nThis functionality also requires a Premium subscription. You can get 15% off by using "
                 "the above affiliate link which also supports the project."
             )
+            return None
 
         if self._esg_scores.empty or overwrite:
             (
@@ -2261,6 +2514,7 @@ class Toolkit:
                 progress_bar=(
                     progress_bar if progress_bar is not None else self._progress_bar
                 ),
+                user_subscription=self._fmp_plan,
             )
 
         esg_scores = self._esg_scores.round(rounding if rounding else self._rounding)
@@ -2340,6 +2594,7 @@ class Toolkit:
 
     def get_treasury_data(
         self,
+        enforce_source: str | None = None,
         period: str = "daily",
         risk_free_rate: str | None = None,
         fill_nan: bool = True,
@@ -2427,6 +2682,14 @@ class Toolkit:
             else []
         )
 
+        if enforce_source is not None and enforce_source not in [
+            "FinancialModelingPrep",
+            "YahooFinance",
+        ]:
+            raise ValueError(
+                "The enforce_source parameter must be either 'FinancialModelingPrep' or 'YahooFinance'."
+            )
+
         if self._daily_treasury_data.empty or False in specific_rates:
             # It collects data in the scenarios where the treasury data is empty or only contains one column which generally
             # means the data was collected for the historical data functionality which only requires a subselection
@@ -2436,7 +2699,11 @@ class Toolkit:
             ) = _get_historical_data(
                 tickers=risk_free_rate_tickers,
                 api_key=self._api_key,
-                source=self._historical_source,
+                enforce_source=(
+                    enforce_source
+                    if enforce_source is not None
+                    else self._enforce_source
+                ),
                 start=self._start_date,
                 end=self._end_date,
                 progress_bar=False,
@@ -2546,7 +2813,7 @@ class Toolkit:
 
         Important to note is that when an api_key is included in the Toolkit initialization that the data
         collection defaults to FinancialModelingPrep which is a more stable source and utilises your subscription.
-        However, if this is undesired, it can be disabled by setting historical_source to "YahooFinance". If
+        However, if this is undesired, it can be disabled by setting enforce_source to "YahooFinance". If
         data collection fails from FinancialModelingPrep it automatically reverts back to YahooFinance.
 
         Args:
@@ -2613,7 +2880,7 @@ class Toolkit:
                 (
                     self._statement_currencies,
                     self._currencies,
-                ) = helpers.determine_currencies(
+                ) = currencies_model.determine_currencies(
                     statement_currencies=self._statistics_statement.xs(
                         "Reported Currency", axis=0, level=1
                     ),
@@ -2634,7 +2901,7 @@ class Toolkit:
                 self._daily_exchange_rate_data, _ = _get_historical_data(
                     tickers=currencies_to_collect_data_for,
                     api_key=self._api_key,
-                    source=self._historical_source,
+                    enforce_source=self._enforce_source,
                     start=self._start_date,
                     end=self._end_date,
                     interval="1d",
@@ -2783,23 +3050,37 @@ class Toolkit:
 
     def get_balance_sheet_statement(
         self,
+        enforce_source: str | None = None,
         overwrite: bool = False,
         rounding: int | None = None,
         growth: bool = False,
         lag: int | list[int] = 1,
-        trailing: int | None = None,
         progress_bar: bool | None = None,
     ):
         """
-        Retrieves the balance sheet statement financial data for the company(s) from the specified source.
+        Retrieves the balance sheet statement data for the specified tickers. The balance sheet statement
+        is a financial statement that provides a snapshot of a company's financial position at a specific
+        point in time. It shows the company's assets, liabilities, and shareholders' equity. The balance sheet
+        statement is divided into three main sections:
+
+        - Assets: Assets are resources owned by the company that have economic value and can be used to
+        generate revenue. Assets are typically divided into current assets and non-current assets.
+        - Liabilities: Liabilities are obligations that the company owes to external parties. Liabilities
+        are also divided into current liabilities and non-current liabilities.
+        - Shareholders' Equity: Shareholders' equity represents the company's net worth or book value. It
+        is calculated as the difference between the company's assets and liabilities.
+
+        Note that the balance sheet statement is a financial statement that provides a snapshot of a
+        company's financial position at a specific point in time. Therefore, trailing results are not
+        available for this statement.
 
         Args:
-            limit (int): Defines the maximum years or quarters to obtain.
+            enforce_source (bool): Defines whether to enforce the source of the data. This can be
+                either "FinancialModelingPrep" or "YahooFinance". Defaults to None.
             overwrite (bool): Defines whether to overwrite the existing data.
             rounding (int): Defines the number of decimal places to round the data to.
             growth (bool): Defines whether to return the growth of the data.
             lag (int | str): Defines the number of periods to lag the growth data by.
-            trailing (int): Defines whether to select a trailing period.
             E.g. when selecting 4 with quarterly data, the TTM is calculated.
             progress_bar (bool): Defines whether to show a progress bar.
 
@@ -2871,36 +3152,86 @@ class Toolkit:
             and (self._balance_sheet_statement.empty or overwrite)
         )
 
-        if not self._api_key and self._balance_sheet_statement.empty:
-            return print(
-                "The requested data requires the api_key parameter to be set, consider "
-                "obtaining a key with the following link: "
+        if (
+            not self._api_key
+            and self._balance_sheet_statement.empty
+            and self._enforce_source == "FinancialModelingPrep"
+        ):
+            logger.error(
+                "The requested data requires the api_key parameter to be set or the enforce_source "
+                "parameter set to 'YahooFinance', consider obtaining a key with the following link: "
                 "https://www.jeroenbouma.com/fmp"
                 "\nThe free plan allows for 250 requests per day, a limit of 5 years and has no "
                 "quarterly data. Consider upgrading your plan. You can get 15% off by using the "
                 "above affiliate link which also supports the project."
             )
+            return None
+
+        if enforce_source is not None and enforce_source not in [
+            "FinancialModelingPrep",
+            "YahooFinance",
+        ]:
+            raise ValueError(
+                "The enforce_source parameter must be either 'FinancialModelingPrep' or 'YahooFinance'."
+            )
+
+        # Correct for the case where a Portfolio ticker exists
+        ticker_list = [ticker for ticker in self._tickers if ticker != "Portfolio"]
 
         if self._balance_sheet_statement.empty or overwrite:
             (
                 self._balance_sheet_statement,
                 self._statistics_statement,
                 self._invalid_tickers,
-            ) = _get_financial_statements(
-                tickers=self._tickers,
+            ) = collect_financial_statements(
+                tickers=ticker_list,
                 statement="balance",
                 api_key=self._api_key,
                 quarter=self._quarterly,
                 start_date=self._start_date,
                 end_date=self._end_date,
                 rounding=rounding if rounding else self._rounding,
-                statement_format=self._balance_sheet_statement_generic,
-                statistics_format=self._statistics_statement_generic,
+                fmp_statement_format=self._fmp_balance_sheet_statement_generic,
+                fmp_statistics_format=self._fmp_statistics_statement_generic,
+                yf_statement_format=self._yf_balance_sheet_statement_generic,
                 sleep_timer=self._sleep_timer,
                 progress_bar=(
                     progress_bar if progress_bar is not None else self._progress_bar
                 ),
+                user_subscription=self._fmp_plan,
+                enforce_source=(
+                    enforce_source
+                    if enforce_source is not None
+                    else self._enforce_source
+                ),
             )
+
+            if convert_currency:
+                self.get_exchange_rates(
+                    period="quarterly" if self._quarterly else "yearly",
+                    progress_bar=(
+                        progress_bar if progress_bar is not None else self._progress_bar
+                    ),
+                )
+
+                if not self._statement_currencies.empty:
+                    self._balance_sheet_statement = currencies_model.convert_currencies(
+                        financial_statement_data=self._balance_sheet_statement,
+                        financial_statement_currencies=self._statement_currencies,
+                        exchange_rate_data=(
+                            self._quarterly_exchange_rate_data["Adj Close"]
+                            if self._quarterly
+                            else self._yearly_exchange_rate_data["Adj Close"]
+                        ),
+                        financial_statement_name="balance sheet statement",
+                    )
+
+            if self._use_cached_data:
+                cache_model.save_cached_data(
+                    cached_data=self._balance_sheet_statement,
+                    cached_data_location=self._cached_data_location,
+                    file_name="balance_sheet_statement.pickle",
+                )
 
         if self._remove_invalid_tickers:
             self._tickers = [
@@ -2911,36 +3242,12 @@ class Toolkit:
 
         balance_sheet_statement = self._balance_sheet_statement
 
-        if trailing:
-            balance_sheet_statement = (
-                self._balance_sheet_statement.T.rolling(trailing).sum().T
-            )
-
         if growth:
-            self._balance_sheet_statement_growth = _calculate_growth(
+            self._balance_sheet_statement_growth = helpers.calculate_growth(
                 balance_sheet_statement,
                 lag=lag,
                 rounding=rounding if rounding else self._rounding,
                 axis="columns",
-            )
-
-        if convert_currency:
-            self.get_exchange_rates(
-                period="quarterly" if self._quarterly else "yearly",
-                progress_bar=(
-                    progress_bar if progress_bar is not None else self._progress_bar
-                ),
-            )
-
-            balance_sheet_statement = helpers.convert_currencies(
-                financial_statement_data=balance_sheet_statement,
-                financial_statement_currencies=self._statement_currencies,
-                exchange_rate_data=(
-                    self._quarterly_exchange_rate_data["Adj Close"]
-                    if self._quarterly
-                    else self._yearly_exchange_rate_data["Adj Close"]
-                ),
-                financial_statement_name="balance sheet statement",
             )
 
         balance_sheet_statement = balance_sheet_statement.round(
@@ -2960,6 +3267,7 @@ class Toolkit:
 
     def get_income_statement(
         self,
+        enforce_source: str | None = None,
         overwrite: bool = False,
         rounding: int | None = None,
         growth: bool = False,
@@ -2968,10 +3276,16 @@ class Toolkit:
         progress_bar: bool | None = None,
     ):
         """
-        Retrieves the income statement financial data for the company(s) from the specified source.
+        Retrieves the income statement data for the specified tickers. The income statement is a financial
+        statement that shows a company's revenues and expenses over a specific period. It is used to calculate
+        a company's net income.
+
+        The income statement is a financial statement that shows a company's revenues and expenses over a specific
+        period. Therefore, trailing results are available for this statement.
 
         Args:
-            limit (int): Defines the maximum years or quarters to obtain.
+            enforce_source (bool): Defines whether to enforce the source of the data. This can be
+                either "FinancialModelingPrep" or "YahooFinance". Defaults to None.
             overwrite (bool): Defines whether to overwrite the existing data.
             rounding (int): Defines the number of decimal places to round the data to.
             growth (bool): Defines whether to return the growth of the data.
@@ -3032,36 +3346,96 @@ class Toolkit:
             self._convert_currency and (self._income_statement.empty or overwrite)
         )
 
-        if not self._api_key and self._income_statement.empty:
-            return print(
-                "The requested data requires the api_key parameter to be set, consider "
-                "obtaining a key with the following link: "
+        if (
+            not self._api_key
+            and self._income_statement.empty
+            and self._enforce_source == "FinancialModelingPrep"
+        ):
+            logger.error(
+                "The requested data requires the api_key parameter to be set or the enforce_source "
+                "parameter set to 'YahooFinance', consider obtaining a key with the following link: "
                 "https://www.jeroenbouma.com/fmp"
                 "\nThe free plan allows for 250 requests per day, a limit of 5 years and has no "
                 "quarterly data. Consider upgrading your plan. You can get 15% off by using the "
                 "above affiliate link which also supports the project."
             )
+            return None
+
+        if enforce_source is not None and enforce_source not in [
+            "FinancialModelingPrep",
+            "YahooFinance",
+        ]:
+            raise ValueError(
+                "The enforce_source parameter must be either 'FinancialModelingPrep' or 'YahooFinance'."
+            )
+
+        # Correct for the case where a Portfolio ticker exists
+        ticker_list = [ticker for ticker in self._tickers if ticker != "Portfolio"]
 
         if self._income_statement.empty or overwrite:
             (
                 self._income_statement,
                 self._statistics_statement,
                 self._invalid_tickers,
-            ) = _get_financial_statements(
-                tickers=self._tickers,
+            ) = collect_financial_statements(
+                tickers=ticker_list,
                 statement="income",
                 api_key=self._api_key,
                 quarter=self._quarterly,
                 start_date=self._start_date,
                 end_date=self._end_date,
                 rounding=rounding if rounding else self._rounding,
-                statement_format=self._income_statement_generic,
-                statistics_format=self._statistics_statement_generic,
+                fmp_statement_format=self._fmp_income_statement_generic,
+                fmp_statistics_format=self._fmp_statistics_statement_generic,
+                yf_statement_format=self._yf_income_statement_generic,
                 sleep_timer=self._sleep_timer,
                 progress_bar=(
                     progress_bar if progress_bar is not None else self._progress_bar
                 ),
+                user_subscription=self._fmp_plan,
+                enforce_source=(
+                    enforce_source
+                    if enforce_source is not None
+                    else self._enforce_source
+                ),
             )
+
+            if convert_currency:
+                self.get_exchange_rates(
+                    period="quarterly" if self._quarterly else "yearly",
+                    progress_bar=(
+                        progress_bar if progress_bar is not None else self._progress_bar
+                    ),
+                )
+                if not self._statement_currencies.empty:
+                    self._income_statement = currencies_model.convert_currencies(
+                        financial_statement_data=self._income_statement,
+                        financial_statement_currencies=self._statement_currencies,
+                        exchange_rate_data=(
+                            self._quarterly_exchange_rate_data["Adj Close"]
+                            if self._quarterly
+                            else self._yearly_exchange_rate_data["Adj Close"]
+                        ),
+                        items_not_to_adjust=[
+                            "Gross Profit Ratio",
+                            "EBITDA Ratio",
+                            "Operating Income Ratio",
+                            "Income Before Tax Ratio",
+                            "Net Income Ratio",
+                            "EPS",
+                            "EPS Diluted",
+                            "Weighted Average Shares",
+                            "Weighted Average Shares Diluted",
+                        ],
+                        financial_statement_name="income statement",
+                    )
+
+            if self._use_cached_data:
+                cache_model.save_cached_data(
+                    cached_data=self._income_statement,
+                    cached_data_location=self._cached_data_location,
+                    file_name="income_statement.pickle",
+                )
 
         if self._remove_invalid_tickers:
             self._tickers = [
@@ -3089,41 +3463,11 @@ class Toolkit:
             )
 
         if growth:
-            self._income_statement_growth = _calculate_growth(
+            self._income_statement_growth = helpers.calculate_growth(
                 income_statement,
                 lag=lag,
                 rounding=rounding if rounding else self._rounding,
                 axis="columns",
-            )
-
-        if convert_currency:
-            self.get_exchange_rates(
-                period="quarterly" if self._quarterly else "yearly",
-                progress_bar=(
-                    progress_bar if progress_bar is not None else self._progress_bar
-                ),
-            )
-
-            income_statement = helpers.convert_currencies(
-                financial_statement_data=income_statement,
-                financial_statement_currencies=self._statement_currencies,
-                exchange_rate_data=(
-                    self._quarterly_exchange_rate_data["Adj Close"]
-                    if self._quarterly
-                    else self._yearly_exchange_rate_data["Adj Close"]
-                ),
-                items_not_to_adjust=[
-                    "Gross Profit Ratio",
-                    "EBITDA Ratio",
-                    "Operating Income Ratio",
-                    "Income Before Tax Ratio",
-                    "Net Income Ratio",
-                    "EPS",
-                    "EPS Diluted",
-                    "Weighted Average Shares",
-                    "Weighted Average Shares Diluted",
-                ],
-                financial_statement_name="income statement",
             )
 
         income_statement = income_statement.round(
@@ -3141,6 +3485,7 @@ class Toolkit:
 
     def get_cash_flow_statement(
         self,
+        enforce_source: str | None = None,
         overwrite: bool = False,
         rounding: int | None = None,
         growth: bool = False,
@@ -3149,10 +3494,15 @@ class Toolkit:
         progress_bar: bool | None = None,
     ):
         """
-        Retrieves the cash flow statement financial data for the company(s) from the specified source.
+        Retrieves the cash flow statement data for the specified tickers. The cash flow statement is a financial
+        statement that shows how changes in balance sheet accounts and income affect cash and cash equivalents.
+        It breaks the analysis down to operating, investing and financing activities.
+
+        The cash flow statement is a financial statement that shows how changes in balance sheet accounts and income
+        affect cash and cash equivalents. Therefore, trailing results are available for this statement.
 
         Args:
-            limit (int): Defines the maximum years or quarters to obtain.
+            enforce_source (bool): Defines whether to enforce the source of the data. This can be
             overwrite (bool): Defines whether to overwrite the existing data.
             rounding (int): Defines the number of decimal places to round the data to.
             growth (bool): Defines whether to return the growth of the data.
@@ -3215,36 +3565,86 @@ class Toolkit:
             self._convert_currency and (self._cash_flow_statement.empty or overwrite)
         )
 
-        if not self._api_key and self._cash_flow_statement.empty:
-            return print(
-                "The requested data requires the api_key parameter to be set, consider "
-                "obtaining a key with the following link: "
+        if (
+            not self._api_key
+            and self._cash_flow_statement.empty
+            and self._enforce_source == "FinancialModelingPrep"
+        ):
+            logger.error(
+                "The requested data requires the api_key parameter to be set or the enforce_source "
+                "parameter set to 'YahooFinance', consider obtaining a key with the following link: "
                 "https://www.jeroenbouma.com/fmp"
                 "\nThe free plan allows for 250 requests per day, a limit of 5 years and has no "
                 "quarterly data. Consider upgrading your plan. You can get 15% off by using the "
                 "above affiliate link which also supports the project."
             )
+            return None
+
+        if enforce_source is not None and enforce_source not in [
+            "FinancialModelingPrep",
+            "YahooFinance",
+        ]:
+            raise ValueError(
+                "The enforce_source parameter must be either 'FinancialModelingPrep' or 'YahooFinance'."
+            )
+
+        # Correct for the case where a Portfolio ticker exists
+        ticker_list = [ticker for ticker in self._tickers if ticker != "Portfolio"]
 
         if self._cash_flow_statement.empty or overwrite:
             (
                 self._cash_flow_statement,
                 self._statistics_statement,
                 self._invalid_tickers,
-            ) = _get_financial_statements(
-                tickers=self._tickers,
+            ) = collect_financial_statements(
+                tickers=ticker_list,
                 statement="cashflow",
                 api_key=self._api_key,
                 quarter=self._quarterly,
                 start_date=self._start_date,
                 end_date=self._end_date,
                 rounding=rounding if rounding else self._rounding,
-                statement_format=self._cash_flow_statement_generic,
-                statistics_format=self._statistics_statement_generic,
+                fmp_statement_format=self._fmp_cash_flow_statement_generic,
+                fmp_statistics_format=self._fmp_statistics_statement_generic,
+                yf_statement_format=self._yf_cash_flow_statement_generic,
                 sleep_timer=self._sleep_timer,
                 progress_bar=(
                     progress_bar if progress_bar is not None else self._progress_bar
                 ),
+                user_subscription=self._fmp_plan,
+                enforce_source=(
+                    enforce_source
+                    if enforce_source is not None
+                    else self._enforce_source
+                ),
             )
+
+            if convert_currency:
+                self.get_exchange_rates(
+                    period="quarterly" if self._quarterly else "yearly",
+                    progress_bar=(
+                        progress_bar if progress_bar is not None else self._progress_bar
+                    ),
+                )
+
+                if not self._statement_currencies.empty:
+                    self._cash_flow_statement = currencies_model.convert_currencies(
+                        financial_statement_data=self._cash_flow_statement,
+                        financial_statement_currencies=self._statement_currencies,
+                        exchange_rate_data=(
+                            self._quarterly_exchange_rate_data["Adj Close"]
+                            if self._quarterly
+                            else self._yearly_exchange_rate_data["Adj Close"]
+                        ),
+                        financial_statement_name="cash flow statement",
+                    )
+
+            if self._use_cached_data:
+                cache_model.save_cached_data(
+                    cached_data=self._cash_flow_statement,
+                    cached_data_location=self._cached_data_location,
+                    file_name="cash_flow_statement.pickle",
+                )
 
         if self._remove_invalid_tickers:
             self._tickers = [
@@ -3259,30 +3659,11 @@ class Toolkit:
             cash_flow_statement = self._cash_flow_statement.T.rolling(trailing).sum().T
 
         if growth:
-            self._cash_flow_statement_growth = _calculate_growth(
+            self._cash_flow_statement_growth = helpers.calculate_growth(
                 cash_flow_statement,
                 lag=lag,
                 rounding=rounding if rounding else self._rounding,
                 axis="columns",
-            )
-
-        if convert_currency:
-            self.get_exchange_rates(
-                period="quarterly" if self._quarterly else "yearly",
-                progress_bar=(
-                    progress_bar if progress_bar is not None else self._progress_bar
-                ),
-            )
-
-            cash_flow_statement = helpers.convert_currencies(
-                financial_statement_data=cash_flow_statement,
-                financial_statement_currencies=self._statement_currencies,
-                exchange_rate_data=(
-                    self._quarterly_exchange_rate_data["Adj Close"]
-                    if self._quarterly
-                    else self._yearly_exchange_rate_data["Adj Close"]
-                ),
-                financial_statement_name="cash flow statement",
             )
 
         cash_flow_statement = cash_flow_statement.round(
@@ -3299,8 +3680,10 @@ class Toolkit:
 
     def get_statistics_statement(
         self,
+        enforce_source: str | None = None,
         overwrite: bool = False,
         progress_bar: bool | None = None,
+        rounding: int | None = None,
     ):
         """
         Retrieves the balance, cash and income statistics for the company(s) from the specified source.
@@ -3309,9 +3692,11 @@ class Toolkit:
         API call. This is done to reduce the number of API calls to FinancialModelingPrep.
 
         Args:
-            limit (int): Defines the maximum years or quarters to obtain.
+            enforce_source (bool): Defines whether to enforce the source of the data. This can be
+                either "FinancialModelingPrep" or "YahooFinance". Defaults to None.
             overwrite (bool): Defines whether to overwrite the existing data.
             progress_bar (bool): Defines whether to show a progress bar.
+            rounding (int): Defines the number of decimal places to round the data to.
 
         Returns:
             pd.DataFrame: A pandas DataFrame with the retrieved statistics statement data.
@@ -3341,33 +3726,60 @@ class Toolkit:
 
         """
         if not self._api_key and self._statistics_statement.empty:
-            return print(
+            logger.error(
                 "The requested data requires the api_key parameter to be set, consider "
                 "obtaining a key with the following link: https://www.jeroenbouma.com/fmp"
                 "\nThe free plan allows for 250 requests per day, a limit of 5 years and has no "
                 "quarterly data. Consider upgrading your plan. You can get 15% off by using the "
                 "above affiliate link which also supports the project."
             )
+            return None
+
+        if enforce_source is not None and enforce_source not in [
+            "FinancialModelingPrep",
+            "YahooFinance",
+        ]:
+            raise ValueError(
+                "The enforce_source parameter must be either 'FinancialModelingPrep' or 'YahooFinance'."
+            )
+
+        # Correct for the case where a Portfolio ticker exists
+        ticker_list = [ticker for ticker in self._tickers if ticker != "Portfolio"]
 
         if self._statistics_statement.empty or overwrite:
             (
                 self._balance_sheet_statement,
                 self._statistics_statement,
                 self._invalid_tickers,
-            ) = _get_financial_statements(
-                tickers=self._tickers,
+            ) = collect_financial_statements(
+                tickers=ticker_list,
                 statement="balance",
                 api_key=self._api_key,
                 quarter=self._quarterly,
                 start_date=self._start_date,
                 end_date=self._end_date,
-                statement_format=self._balance_sheet_statement_generic,
-                statistics_format=self._statistics_statement_generic,
+                rounding=rounding if rounding else self._rounding,
+                fmp_statement_format=self._fmp_balance_sheet_statement_generic,
+                fmp_statistics_format=self._fmp_statistics_statement_generic,
+                yf_statement_format=self._yf_balance_sheet_statement_generic,
                 sleep_timer=self._sleep_timer,
                 progress_bar=(
                     progress_bar if progress_bar is not None else self._progress_bar
                 ),
+                user_subscription=self._fmp_plan,
+                enforce_source=(
+                    self._enforce_source
+                    if enforce_source is not None
+                    else self._enforce_source
+                ),
             )
+
+            if self._use_cached_data:
+                cache_model.save_cached_data(
+                    cached_data=self._statistics_statement,
+                    cached_data_location=self._cached_data_location,
+                    file_name="statistics_statement.pickle",
+                )
 
         if self._remove_invalid_tickers:
             self._tickers = [

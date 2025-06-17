@@ -3,10 +3,12 @@
 __docformat__ = "google"
 
 
+import warnings
+
 import numpy as np
 import pandas as pd
 
-from financetoolkit.helpers import calculate_growth, handle_errors
+from financetoolkit.helpers import calculate_growth, handle_portfolio
 from financetoolkit.ratios import (
     efficiency_model,
     liquidity_model,
@@ -14,6 +16,16 @@ from financetoolkit.ratios import (
     solvency_model,
     valuation_model,
 )
+from financetoolkit.ratios.helpers import map_period_data_to_daily_data
+from financetoolkit.utilities import logger_model
+from financetoolkit.utilities.error_model import handle_errors
+
+logger = logger_model.get_logger()
+
+# Runtime errors are ignored on purpose given the nature of the calculations
+# sometimes leading to division by zero or other mathematical errors. This is however
+# for financial analysis purposes not an issue and should not be considered as a bug.
+warnings.filterwarnings("ignore", category=RuntimeWarning)
 
 # pylint: disable=too-many-lines,too-many-instance-attributes,too-many-public-methods,too-many-locals,eval-used
 
@@ -29,7 +41,7 @@ class Ratios:
     def __init__(
         self,
         tickers: str | list[str],
-        historical: pd.DataFrame,
+        historical: dict[str, pd.DataFrame],
         balance: pd.DataFrame,
         income: pd.DataFrame,
         cash: pd.DataFrame,
@@ -41,7 +53,8 @@ class Ratios:
 
         Args:
             tickers (str | list[str]): The tickers to use for the calculations.
-            historical (pd.DataFrame): The historical data to use for the calculations.
+            historical (dict[str, pd.DataFrame]): The historical data to use for the calculations.
+                Typically includes a "period" and "daily" key to access the respective data.
             balance (pd.DataFrame): The balance sheet data to use for the calculations.
             income (pd.DataFrame): The income statement data to use for the calculations.
             cash (pd.DataFrame): The cash flow statement data to use for the calculations.
@@ -83,6 +96,9 @@ class Ratios:
         | EBIT to Revenue                             | 0.286688 | 0.26641  | 0.254864 | 0.305759 | 0.309473 |
         """
         self._tickers = tickers
+        self._tickers_without_portfolio = [
+            ticker for ticker in tickers if ticker != "Portfolio"
+        ]
         self._balance_sheet_statement: pd.DataFrame = balance
         self._income_statement: pd.DataFrame = income
         self._cash_flow_statement: pd.DataFrame = cash
@@ -91,9 +107,11 @@ class Ratios:
         self._custom_ratios_growth: pd.DataFrame = pd.DataFrame()
         self._rounding: int | None = rounding
         self._quarterly: bool = quarterly
+        self._portfolio_weights: dict | None = None
 
         # Initialization of Historical Data
-        self._historical_data: pd.DataFrame = historical
+        self._historical_data: pd.DataFrame = historical["period"]
+        self._daily_historical_data: pd.DataFrame = historical["daily"]
 
         # Initialization of Fundamentals Variables
         self._all_ratios: pd.DataFrame = pd.DataFrame()
@@ -109,7 +127,6 @@ class Ratios:
         self._valuation_ratios: pd.DataFrame = pd.DataFrame()
         self._valuation_ratios_growth: pd.DataFrame = pd.DataFrame()
 
-    @handle_errors
     def collect_all_ratios(
         self,
         include_dividends: bool = False,
@@ -209,7 +226,6 @@ class Ratios:
 
         return self._all_ratios_growth if growth else self._all_ratios
 
-    @handle_errors
     def collect_custom_ratios(
         self,
         custom_ratios_dict: dict | None = None,
@@ -286,15 +302,15 @@ class Ratios:
             self.collect_all_ratios()
 
         if not custom_ratios_dict and not options:
-            print(
+            logger.error(
                 "Please define custom ratios dictionary to the custom_ratios_dict parameter. See "
                 "https://www.jeroenbouma.com/projects/financetoolkit/custom-ratios how to do this."
             )
             return None
 
         if options:
-            print(
-                "The following names are available to be used in the Custom Ratios calculations.\n"
+            logger.info(
+                "The following names are available to be used in the Custom Ratios calculations."
             )
 
             self._available_custom_ratios_options = list(
@@ -390,10 +406,12 @@ class Ratios:
                         float(formula_section_stripped)
                     except ValueError:
                         formula_adjusted = None
-                        print(
-                            f"Column {formula_section_stripped} not found in total_financials and is not a number. "
-                            f"Therefore the formula {formula} is invalid. Use collect_custom_ratios(options=True) "
-                            "to see the available columns."
+                        logger.error(
+                            "Column %s not found in total_financials and is not a number. "
+                            "Therefore the formula %s is invalid. Use collect_custom_ratios(options=True) "
+                            "to see the available columns.",
+                            formula_section_stripped,
+                            formula,
                         )
                         break
 
@@ -432,6 +450,7 @@ class Ratios:
 
         return self._custom_ratios_growth if growth else self._custom_ratios
 
+    @handle_errors
     def collect_efficiency_ratios(
         self,
         days: int | float | None = None,
@@ -521,6 +540,9 @@ class Ratios:
             .dropna(axis="columns", how="all")
         )
 
+        # Ensure the ticker order remains the same as in self._tickers
+        self._efficiency_ratios = self._efficiency_ratios.loc[self._tickers]
+
         self._efficiency_ratios = self._efficiency_ratios.round(
             rounding if rounding else self._rounding
         )
@@ -553,6 +575,7 @@ class Ratios:
 
         return self._efficiency_ratios_growth if growth else self._efficiency_ratios
 
+    @handle_portfolio
     @handle_errors
     def get_asset_turnover_ratio(
         self,
@@ -605,20 +628,17 @@ class Ratios:
             asset_turnover_ratio = efficiency_model.get_asset_turnover_ratio(
                 self._income_statement.loc[:, "Revenue", :].T.rolling(trailing).sum().T,
                 self._balance_sheet_statement.loc[:, "Total Assets", :]
-                .shift(axis=1)
                 .T.rolling(trailing)
-                .sum()
-                .T,
-                self._balance_sheet_statement.loc[:, "Total Assets", :]
-                .T.rolling(trailing)
-                .sum()
+                .mean()
                 .T,
             )
         else:
             asset_turnover_ratio = efficiency_model.get_asset_turnover_ratio(
                 self._income_statement.loc[:, "Revenue", :],
-                self._balance_sheet_statement.loc[:, "Total Assets", :].shift(axis=1),
-                self._balance_sheet_statement.loc[:, "Total Assets", :],
+                self._balance_sheet_statement.loc[:, "Total Assets", :]
+                .T.rolling(2)
+                .mean()
+                .T,
             )
 
         if growth:
@@ -630,6 +650,7 @@ class Ratios:
 
         return asset_turnover_ratio.round(rounding if rounding else self._rounding)
 
+    @handle_portfolio
     @handle_errors
     def get_inventory_turnover_ratio(
         self,
@@ -685,20 +706,17 @@ class Ratios:
                 .sum()
                 .T,
                 self._balance_sheet_statement.loc[:, "Inventory", :]
-                .shift(axis=1)
                 .T.rolling(trailing)
-                .sum()
-                .T,
-                self._balance_sheet_statement.loc[:, "Inventory", :]
-                .T.rolling(trailing)
-                .sum()
+                .mean()
                 .T,
             )
         else:
             inventory_turnover_ratio = efficiency_model.get_inventory_turnover_ratio(
                 self._income_statement.loc[:, "Cost of Goods Sold", :],
-                self._balance_sheet_statement.loc[:, "Inventory", :].shift(axis=1),
-                self._balance_sheet_statement.loc[:, "Inventory", :],
+                self._balance_sheet_statement.loc[:, "Inventory", :]
+                .T.rolling(2)
+                .mean()
+                .T,
             )
 
         if growth:
@@ -710,6 +728,7 @@ class Ratios:
 
         return inventory_turnover_ratio.round(rounding if rounding else self._rounding)
 
+    @handle_portfolio
     @handle_errors
     def get_days_of_inventory_outstanding(
         self,
@@ -767,13 +786,8 @@ class Ratios:
             days_of_inventory_outstanding = (
                 efficiency_model.get_days_of_inventory_outstanding(
                     self._balance_sheet_statement.loc[:, "Inventory", :]
-                    .shift(axis=1)
                     .T.rolling(trailing)
-                    .sum()
-                    .T,
-                    self._balance_sheet_statement.loc[:, "Inventory", :]
-                    .T.rolling(trailing)
-                    .sum()
+                    .mean()
                     .T,
                     self._income_statement.loc[:, "Cost of Goods Sold", :]
                     .T.rolling(trailing)
@@ -784,8 +798,10 @@ class Ratios:
         else:
             days_of_inventory_outstanding = (
                 efficiency_model.get_days_of_inventory_outstanding(
-                    self._balance_sheet_statement.loc[:, "Inventory", :].shift(axis=1),
-                    self._balance_sheet_statement.loc[:, "Inventory", :],
+                    self._balance_sheet_statement.loc[:, "Inventory", :]
+                    .T.rolling(2)
+                    .mean()
+                    .T,
                     self._income_statement.loc[:, "Cost of Goods Sold", :],
                     days,
                 )
@@ -802,6 +818,7 @@ class Ratios:
             rounding if rounding else self._rounding
         )
 
+    @handle_portfolio
     @handle_errors
     def get_days_of_sales_outstanding(
         self,
@@ -859,22 +876,17 @@ class Ratios:
         if trailing:
             days_of_sales_outstanding = efficiency_model.get_days_of_sales_outstanding(
                 self._balance_sheet_statement.loc[:, "Accounts Receivable", :]
-                .shift(axis=1)
                 .T.rolling(trailing)
-                .sum()
-                .T,
-                self._balance_sheet_statement.loc[:, "Accounts Receivable", :]
-                .T.rolling(trailing)
-                .sum()
+                .mean()
                 .T,
                 self._income_statement.loc[:, "Revenue", :].T.rolling(trailing).sum().T,
             )
         else:
             days_of_sales_outstanding = efficiency_model.get_days_of_sales_outstanding(
-                self._balance_sheet_statement.loc[:, "Accounts Receivable", :].shift(
-                    axis=1
-                ),
-                self._balance_sheet_statement.loc[:, "Accounts Receivable", :],
+                self._balance_sheet_statement.loc[:, "Accounts Receivable", :]
+                .T.rolling(2)
+                .mean()
+                .T,
                 self._income_statement.loc[:, "Revenue", :],
                 days,
             )
@@ -888,6 +900,7 @@ class Ratios:
 
         return days_of_sales_outstanding.round(rounding if rounding else self._rounding)
 
+    @handle_portfolio
     @handle_errors
     def get_operating_cycle(
         self,
@@ -943,13 +956,8 @@ class Ratios:
         if trailing:
             days_of_inventory = efficiency_model.get_days_of_inventory_outstanding(
                 self._balance_sheet_statement.loc[:, "Inventory", :]
-                .shift(axis=1)
                 .T.rolling(trailing)
-                .sum()
-                .T,
-                self._balance_sheet_statement.loc[:, "Inventory", :]
-                .T.rolling(trailing)
-                .sum()
+                .mean()
                 .T,
                 self._income_statement.loc[:, "Cost of Goods Sold", :]
                 .T.rolling(trailing)
@@ -962,27 +970,25 @@ class Ratios:
                 self._balance_sheet_statement.loc[:, "Accounts Receivable", :]
                 .shift(axis=1)
                 .T.rolling(trailing)
-                .sum()
-                .T,
-                self._balance_sheet_statement.loc[:, "Accounts Receivable", :]
-                .T.rolling(trailing)
-                .sum()
+                .mean()
                 .T,
                 self._income_statement.loc[:, "Revenue", :].T.rolling(trailing).sum().T,
                 days,
             )
         else:
             days_of_inventory = efficiency_model.get_days_of_inventory_outstanding(
-                self._balance_sheet_statement.loc[:, "Inventory", :].shift(axis=1),
-                self._balance_sheet_statement.loc[:, "Inventory", :],
+                self._balance_sheet_statement.loc[:, "Inventory", :]
+                .T.rolling(2)
+                .mean()
+                .T,
                 self._income_statement.loc[:, "Cost of Goods Sold", :],
                 days,
             )
             days_of_sales = efficiency_model.get_days_of_sales_outstanding(
-                self._balance_sheet_statement.loc[:, "Accounts Receivable", :].shift(
-                    axis=1
-                ),
-                self._balance_sheet_statement.loc[:, "Accounts Receivable", :],
+                self._balance_sheet_statement.loc[:, "Accounts Receivable", :]
+                .T.rolling(2)
+                .mean()
+                .T,
                 self._income_statement.loc[:, "Revenue", :],
                 days,
             )
@@ -1000,6 +1006,7 @@ class Ratios:
 
         return operating_cycle.round(rounding if rounding else self._rounding)
 
+    @handle_portfolio
     @handle_errors
     def get_accounts_payables_turnover_ratio(
         self,
@@ -1055,13 +1062,8 @@ class Ratios:
                     .sum()
                     .T,
                     self._balance_sheet_statement.loc[:, "Accounts Payable", :]
-                    .shift(axis=1)
                     .T.rolling(trailing)
-                    .sum()
-                    .T,
-                    self._balance_sheet_statement.loc[:, "Accounts Payable", :]
-                    .T.rolling(trailing)
-                    .sum()
+                    .mean()
                     .T,
                 )
             )
@@ -1069,10 +1071,10 @@ class Ratios:
             accounts_payables_turnover_ratio = (
                 efficiency_model.get_accounts_payables_turnover_ratio(
                     self._income_statement.loc[:, "Cost of Goods Sold", :],
-                    self._balance_sheet_statement.loc[:, "Accounts Payable", :].shift(
-                        axis=1
-                    ),
-                    self._balance_sheet_statement.loc[:, "Accounts Payable", :],
+                    self._balance_sheet_statement.loc[:, "Accounts Payable", :]
+                    .T.rolling(2)
+                    .mean()
+                    .T,
                 )
             )
 
@@ -1087,6 +1089,7 @@ class Ratios:
             rounding if rounding else self._rounding
         )
 
+    @handle_portfolio
     @handle_errors
     def get_days_of_accounts_payable_outstanding(
         self,
@@ -1148,13 +1151,8 @@ class Ratios:
                     .sum()
                     .T,
                     self._balance_sheet_statement.loc[:, "Accounts Payable", :]
-                    .shift(axis=1)
                     .T.rolling(trailing)
-                    .sum()
-                    .T,
-                    self._balance_sheet_statement.loc[:, "Accounts Payable", :]
-                    .T.rolling(trailing)
-                    .sum()
+                    .mean()
                     .T,
                 )
             )
@@ -1162,10 +1160,10 @@ class Ratios:
             days_of_accounts_payable_outstanding = (
                 efficiency_model.get_days_of_accounts_payable_outstanding(
                     self._income_statement.loc[:, "Cost of Goods Sold", :],
-                    self._balance_sheet_statement.loc[:, "Accounts Payable", :].shift(
-                        axis=1
-                    ),
-                    self._balance_sheet_statement.loc[:, "Accounts Payable", :],
+                    self._balance_sheet_statement.loc[:, "Accounts Payable", :]
+                    .T.rolling(2)
+                    .mean()
+                    .T,
                     days,
                 )
             )
@@ -1181,6 +1179,7 @@ class Ratios:
             rounding if rounding else self._rounding
         )
 
+    @handle_portfolio
     @handle_errors
     def get_cash_conversion_cycle(
         self,
@@ -1236,13 +1235,8 @@ class Ratios:
         if trailing:
             days_of_inventory = efficiency_model.get_days_of_inventory_outstanding(
                 self._balance_sheet_statement.loc[:, "Inventory", :]
-                .shift(axis=1)
                 .T.rolling(trailing)
-                .sum()
-                .T,
-                self._balance_sheet_statement.loc[:, "Inventory", :]
-                .T.rolling(trailing)
-                .sum()
+                .mean()
                 .T,
                 self._income_statement.loc[:, "Cost of Goods Sold", :]
                 .T.rolling(trailing)
@@ -1253,13 +1247,8 @@ class Ratios:
 
             days_of_sales = efficiency_model.get_days_of_sales_outstanding(
                 self._balance_sheet_statement.loc[:, "Accounts Receivable", :]
-                .shift(axis=1)
                 .T.rolling(trailing)
-                .sum()
-                .T,
-                self._balance_sheet_statement.loc[:, "Accounts Receivable", :]
-                .T.rolling(trailing)
-                .sum()
+                .mean()
                 .T,
                 self._income_statement.loc[:, "Revenue", :].T.rolling(trailing).sum().T,
                 days,
@@ -1272,28 +1261,26 @@ class Ratios:
                     .sum()
                     .T,
                     self._balance_sheet_statement.loc[:, "Accounts Payable", :]
-                    .shift(axis=1)
                     .T.rolling(trailing)
-                    .sum()
+                    .mean()
                     .T,
-                    self._balance_sheet_statement.loc[:, "Accounts Payable", :]
-                    .T.rolling(trailing)
-                    .sum()
-                    .T,
+                    days,
                 )
             )
         else:
             days_of_inventory = efficiency_model.get_days_of_inventory_outstanding(
-                self._balance_sheet_statement.loc[:, "Inventory", :].shift(axis=1),
-                self._balance_sheet_statement.loc[:, "Inventory", :],
+                self._balance_sheet_statement.loc[:, "Inventory", :]
+                .T.rolling(2)
+                .mean()
+                .T,
                 self._income_statement.loc[:, "Cost of Goods Sold", :],
                 days,
             )
             days_of_sales = efficiency_model.get_days_of_sales_outstanding(
-                self._balance_sheet_statement.loc[:, "Accounts Receivable", :].shift(
-                    axis=1
-                ),
-                self._balance_sheet_statement.loc[:, "Accounts Receivable", :],
+                self._balance_sheet_statement.loc[:, "Accounts Receivable", :]
+                .T.rolling(2)
+                .mean()
+                .T,
                 self._income_statement.loc[:, "Revenue", :],
                 days,
             )
@@ -1301,10 +1288,10 @@ class Ratios:
             days_of_payables = (
                 efficiency_model.get_days_of_accounts_payable_outstanding(
                     self._income_statement.loc[:, "Cost of Goods Sold", :],
-                    self._balance_sheet_statement.loc[:, "Accounts Payable", :].shift(
-                        axis=1
-                    ),
-                    self._balance_sheet_statement.loc[:, "Accounts Payable", :],
+                    self._balance_sheet_statement.loc[:, "Accounts Payable", :]
+                    .T.rolling(2)
+                    .mean()
+                    .T,
                     days,
                 )
             )
@@ -1322,6 +1309,7 @@ class Ratios:
 
         return cash_conversion_cycle.round(rounding if rounding else self._rounding)
 
+    @handle_portfolio
     @handle_errors
     def get_cash_conversion_efficiency(
         self,
@@ -1373,7 +1361,7 @@ class Ratios:
         if trailing:
             cash_conversion_efficiency = (
                 efficiency_model.get_cash_conversion_efficiency(
-                    self._cash_flow_statement.loc[:, "Operating Cash Flow", :]
+                    self._cash_flow_statement.loc[:, "Cash Flow from Operations", :]
                     .T.rolling(trailing)
                     .sum()
                     .T,
@@ -1386,7 +1374,7 @@ class Ratios:
         else:
             cash_conversion_efficiency = (
                 efficiency_model.get_cash_conversion_efficiency(
-                    self._cash_flow_statement.loc[:, "Operating Cash Flow", :],
+                    self._cash_flow_statement.loc[:, "Cash Flow from Operations", :],
                     self._income_statement.loc[:, "Revenue", :],
                 )
             )
@@ -1402,6 +1390,7 @@ class Ratios:
             rounding if rounding else self._rounding
         )
 
+    @handle_portfolio
     @handle_errors
     def get_receivables_turnover(
         self,
@@ -1451,22 +1440,17 @@ class Ratios:
         if trailing:
             receivables_turnover = efficiency_model.get_receivables_turnover(
                 self._balance_sheet_statement.loc[:, "Accounts Receivable", :]
-                .shift(axis=1)
                 .T.rolling(trailing)
-                .sum()
-                .T,
-                self._balance_sheet_statement.loc[:, "Accounts Receivable", :]
-                .T.rolling(trailing)
-                .sum()
+                .mean()
                 .T,
                 self._income_statement.loc[:, "Revenue", :].T.rolling(trailing).sum().T,
             )
         else:
             receivables_turnover = efficiency_model.get_receivables_turnover(
-                self._balance_sheet_statement.loc[:, "Accounts Receivable", :].shift(
-                    axis=1
-                ),
-                self._balance_sheet_statement.loc[:, "Accounts Receivable", :],
+                self._balance_sheet_statement.loc[:, "Accounts Receivable", :]
+                .T.rolling(2)
+                .mean()
+                .T,
                 self._income_statement.loc[:, "Revenue", :],
             )
 
@@ -1479,6 +1463,7 @@ class Ratios:
 
         return receivables_turnover.round(rounding if rounding else self._rounding)
 
+    @handle_portfolio
     @handle_errors
     def get_sga_to_revenue_ratio(
         self,
@@ -1553,6 +1538,7 @@ class Ratios:
 
         return sga_to_revenue_ratio.round(rounding if rounding else self._rounding)
 
+    @handle_portfolio
     @handle_errors
     def get_fixed_asset_turnover(
         self,
@@ -1604,20 +1590,17 @@ class Ratios:
             fixed_asset_turnover = efficiency_model.get_fixed_asset_turnover(
                 self._income_statement.loc[:, "Revenue", :].T.rolling(trailing).sum().T,
                 self._balance_sheet_statement.loc[:, "Fixed Assets", :]
-                .shift(axis=1)
                 .T.rolling(trailing)
-                .sum()
-                .T,
-                self._balance_sheet_statement.loc[:, "Fixed Assets", :]
-                .T.rolling(trailing)
-                .sum()
+                .mean()
                 .T,
             )
         else:
             fixed_asset_turnover = efficiency_model.get_fixed_asset_turnover(
                 self._income_statement.loc[:, "Revenue", :],
-                self._balance_sheet_statement.loc[:, "Fixed Assets", :].shift(axis=1),
-                self._balance_sheet_statement.loc[:, "Fixed Assets", :],
+                self._balance_sheet_statement.loc[:, "Fixed Assets", :]
+                .T.rolling(2)
+                .mean()
+                .T,
             )
 
         if growth:
@@ -1629,6 +1612,7 @@ class Ratios:
 
         return fixed_asset_turnover.round(rounding if rounding else self._rounding)
 
+    @handle_portfolio
     @handle_errors
     def get_operating_ratio(
         self,
@@ -1763,6 +1747,8 @@ class Ratios:
             .dropna(axis="columns", how="all")
         )
 
+        self._liquidity_ratios = self._liquidity_ratios.loc[self._tickers]
+
         self._liquidity_ratios = self._liquidity_ratios.round(
             rounding if rounding else self._rounding
         )
@@ -1795,6 +1781,7 @@ class Ratios:
 
         return self._liquidity_ratios_growth if growth else self._liquidity_ratios
 
+    @handle_portfolio
     @handle_errors
     def get_current_ratio(
         self,
@@ -1845,11 +1832,11 @@ class Ratios:
             current_ratio = liquidity_model.get_current_ratio(
                 self._balance_sheet_statement.loc[:, "Total Current Assets", :]
                 .T.rolling(trailing)
-                .sum()
+                .mean()
                 .T,
                 self._balance_sheet_statement.loc[:, "Total Current Liabilities", :]
                 .T.rolling(trailing)
-                .sum()
+                .mean()
                 .T,
             )
         else:
@@ -1867,6 +1854,7 @@ class Ratios:
 
         return current_ratio.round(rounding if rounding else self._rounding)
 
+    @handle_portfolio
     @handle_errors
     def get_quick_ratio(
         self,
@@ -1919,19 +1907,19 @@ class Ratios:
             quick_ratio = liquidity_model.get_quick_ratio(
                 self._balance_sheet_statement.loc[:, "Cash and Cash Equivalents", :]
                 .T.rolling(trailing)
-                .sum()
+                .mean()
                 .T,
                 self._balance_sheet_statement.loc[:, "Short Term Investments", :]
                 .T.rolling(trailing)
-                .sum()
+                .mean()
                 .T,
                 self._balance_sheet_statement.loc[:, "Accounts Receivable", :]
                 .T.rolling(trailing)
-                .sum()
+                .mean()
                 .T,
                 self._balance_sheet_statement.loc[:, "Total Current Liabilities", :]
                 .T.rolling(trailing)
-                .sum()
+                .mean()
                 .T,
             )
         else:
@@ -1949,6 +1937,7 @@ class Ratios:
 
         return quick_ratio.round(rounding if rounding else self._rounding)
 
+    @handle_portfolio
     @handle_errors
     def get_cash_ratio(
         self,
@@ -1999,15 +1988,15 @@ class Ratios:
             cash_ratio = liquidity_model.get_cash_ratio(
                 self._balance_sheet_statement.loc[:, "Cash and Cash Equivalents", :]
                 .T.rolling(trailing)
-                .sum()
+                .mean()
                 .T,
                 self._balance_sheet_statement.loc[:, "Short Term Investments", :]
                 .T.rolling(trailing)
-                .sum()
+                .mean()
                 .T,
                 self._balance_sheet_statement.loc[:, "Total Current Liabilities", :]
                 .T.rolling(trailing)
-                .sum()
+                .mean()
                 .T,
             )
         else:
@@ -2024,6 +2013,7 @@ class Ratios:
 
         return cash_ratio.round(rounding if rounding else self._rounding)
 
+    @handle_portfolio
     @handle_errors
     def get_working_capital(
         self,
@@ -2074,11 +2064,11 @@ class Ratios:
             working_capital = liquidity_model.get_working_capital(
                 self._balance_sheet_statement.loc[:, "Total Current Assets", :]
                 .T.rolling(trailing)
-                .sum()
+                .mean()
                 .T,
                 self._balance_sheet_statement.loc[:, "Total Current Liabilities", :]
                 .T.rolling(trailing)
-                .sum()
+                .mean()
                 .T,
             )
         else:
@@ -2096,6 +2086,7 @@ class Ratios:
 
         return working_capital.round(rounding if rounding else self._rounding)
 
+    @handle_portfolio
     @handle_errors
     def get_operating_cash_flow_ratio(
         self,
@@ -2150,7 +2141,7 @@ class Ratios:
                 .T,
                 self._balance_sheet_statement.loc[:, "Total Current Liabilities", :]
                 .T.rolling(trailing)
-                .sum()
+                .mean()
                 .T,
             )
         else:
@@ -2168,6 +2159,7 @@ class Ratios:
 
         return operating_cash_flow_ratio.round(rounding if rounding else self._rounding)
 
+    @handle_portfolio
     @handle_errors
     def get_operating_cash_flow_sales_ratio(
         self,
@@ -2246,6 +2238,7 @@ class Ratios:
             rounding if rounding else self._rounding
         )
 
+    @handle_portfolio
     @handle_errors
     def get_short_term_coverage_ratio(
         self,
@@ -2290,15 +2283,15 @@ class Ratios:
                 .T,
                 self._balance_sheet_statement.loc[:, "Accounts Receivable", :]
                 .T.rolling(trailing)
-                .sum()
+                .mean()
                 .T,
                 self._balance_sheet_statement.loc[:, "Inventory", :]
                 .T.rolling(trailing)
-                .sum()
+                .mean()
                 .T,
                 self._balance_sheet_statement.loc[:, "Accounts Payable", :]
                 .T.rolling(trailing)
-                .sum()
+                .mean()
                 .T,
             )
         else:
@@ -2409,6 +2402,8 @@ class Ratios:
             .dropna(axis="columns", how="all")
         )
 
+        self._profitability_ratios = self._profitability_ratios.loc[self._tickers]
+
         self._profitability_ratios = self._profitability_ratios.round(
             rounding if rounding else self._rounding
         )
@@ -2443,6 +2438,7 @@ class Ratios:
             self._profitability_ratios_growth if growth else self._profitability_ratios
         )
 
+    @handle_portfolio
     @handle_errors
     def get_gross_margin(
         self,
@@ -2510,6 +2506,7 @@ class Ratios:
 
         return gross_margin.round(rounding if rounding else self._rounding)
 
+    @handle_portfolio
     @handle_errors
     def get_operating_margin(
         self,
@@ -2579,6 +2576,7 @@ class Ratios:
 
         return operating_margin.round(rounding if rounding else self._rounding)
 
+    @handle_portfolio
     @handle_errors
     def get_net_profit_margin(
         self,
@@ -2648,6 +2646,7 @@ class Ratios:
 
         return net_profit_margin.round(rounding if rounding else self._rounding)
 
+    @handle_portfolio
     @handle_errors
     def get_interest_burden_ratio(
         self,
@@ -2724,6 +2723,7 @@ class Ratios:
 
         return interest_burden_ratio.round(rounding if rounding else self._rounding)
 
+    @handle_portfolio
     @handle_errors
     def get_income_before_tax_profit_margin(
         self,
@@ -2801,6 +2801,7 @@ class Ratios:
             rounding if rounding else self._rounding
         )
 
+    @handle_portfolio
     @handle_errors
     def get_effective_tax_rate(
         self,
@@ -2872,6 +2873,7 @@ class Ratios:
 
         return effective_tax_rate.round(rounding if rounding else self._rounding)
 
+    @handle_portfolio
     @handle_errors
     def get_return_on_assets(
         self,
@@ -2925,20 +2927,17 @@ class Ratios:
                 .sum()
                 .T,
                 self._balance_sheet_statement.loc[:, "Total Assets", :]
-                .shift(axis=1)
                 .T.rolling(trailing)
-                .sum()
-                .T,
-                self._balance_sheet_statement.loc[:, "Total Assets", :]
-                .T.rolling(trailing)
-                .sum()
+                .mean()
                 .T,
             )
         else:
             return_on_assets = profitability_model.get_return_on_assets(
                 self._income_statement.loc[:, "Net Income", :],
-                self._balance_sheet_statement.loc[:, "Total Assets", :].shift(axis=1),
-                self._balance_sheet_statement.loc[:, "Total Assets", :],
+                self._balance_sheet_statement.loc[:, "Total Assets", :]
+                .T.rolling(2)
+                .mean()
+                .T,
             )
 
         if growth:
@@ -2950,6 +2949,7 @@ class Ratios:
 
         return return_on_assets.round(rounding if rounding else self._rounding)
 
+    @handle_portfolio
     @handle_errors
     def get_return_on_equity(
         self,
@@ -3006,21 +3006,18 @@ class Ratios:
                 .sum()
                 .T,
                 self._balance_sheet_statement.loc[:, "Total Equity", :]
-                .shift(axis=1)
-                .T.rolling(trailing)
-                .sum()
-                .T,
-                self._balance_sheet_statement.loc[:, "Total Equity", :]
-                .T.rolling(trailing)
-                .sum()
+                .T.rolling(window=trailing)
+                .mean()
                 .T,
             )
 
         else:
             return_on_equity = profitability_model.get_return_on_equity(
                 self._income_statement.loc[:, "Net Income", :],
-                self._balance_sheet_statement.loc[:, "Total Equity", :].shift(axis=1),
-                self._balance_sheet_statement.loc[:, "Total Equity", :],
+                self._balance_sheet_statement.loc[:, "Total Equity", :]
+                .T.rolling(window=2)
+                .mean()
+                .T,
             )
 
         if growth:
@@ -3032,6 +3029,7 @@ class Ratios:
 
         return return_on_equity.round(rounding if rounding else self._rounding)
 
+    @handle_portfolio
     @handle_errors
     def get_return_on_invested_capital(
         self,
@@ -3095,22 +3093,12 @@ class Ratios:
                         else 0
                     ),
                     self._balance_sheet_statement.loc[:, "Total Equity", :]
-                    .shift(axis=1)
                     .T.rolling(trailing)
-                    .sum()
-                    .T,
-                    self._balance_sheet_statement.loc[:, "Total Equity", :]
-                    .T.rolling(trailing)
-                    .sum()
-                    .T,
-                    self._balance_sheet_statement.loc[:, "Total Debt", :]
-                    .shift(axis=1)
-                    .T.rolling(trailing)
-                    .sum()
+                    .mean()
                     .T,
                     self._balance_sheet_statement.loc[:, "Total Debt", :]
                     .T.rolling(trailing)
-                    .sum()
+                    .mean()
                     .T,
                 )
             )
@@ -3123,12 +3111,14 @@ class Ratios:
                         if dividend_adjusted
                         else 0
                     ),
-                    self._balance_sheet_statement.loc[:, "Total Equity", :].shift(
-                        axis=1
-                    ),
-                    self._balance_sheet_statement.loc[:, "Total Equity", :],
-                    self._balance_sheet_statement.loc[:, "Total Debt", :].shift(axis=1),
-                    self._balance_sheet_statement.loc[:, "Total Debt", :],
+                    self._balance_sheet_statement.loc[:, "Total Equity", :]
+                    .T.rolling(2)
+                    .mean()
+                    .T,
+                    self._balance_sheet_statement.loc[:, "Total Debt", :]
+                    .T.rolling(2)
+                    .mean()
+                    .T,
                 )
             )
 
@@ -3143,6 +3133,7 @@ class Ratios:
             rounding if rounding else self._rounding
         )
 
+    @handle_portfolio
     @handle_errors
     def get_income_quality_ratio(
         self,
@@ -3195,7 +3186,7 @@ class Ratios:
                 .T.rolling(trailing)
                 .sum()
                 .T,
-                self._cash_flow_statement.loc[:, "Net Income", :]
+                self._income_statement.loc[:, "Net Income", :]
                 .T.rolling(trailing)
                 .sum()
                 .T,
@@ -3203,7 +3194,7 @@ class Ratios:
         else:
             income_quality_ratio = profitability_model.get_income_quality_ratio(
                 self._cash_flow_statement.loc[:, "Cash Flow from Operations", :],
-                self._cash_flow_statement.loc[:, "Net Income", :],
+                self._income_statement.loc[:, "Net Income", :],
             )
 
         if growth:
@@ -3215,6 +3206,7 @@ class Ratios:
 
         return income_quality_ratio.round(rounding if rounding else self._rounding)
 
+    @handle_portfolio
     @handle_errors
     def get_return_on_tangible_assets(
         self,
@@ -3268,31 +3260,16 @@ class Ratios:
                     .sum()
                     .T,
                     self._balance_sheet_statement.loc[:, "Total Assets", :]
-                    .shift(axis=1)
                     .T.rolling(trailing)
-                    .sum()
-                    .T,
-                    self._balance_sheet_statement.loc[:, "Total Assets", :]
-                    .T.rolling(trailing)
-                    .sum()
-                    .T,
-                    self._balance_sheet_statement.loc[:, "Intangible Assets", :]
-                    .shift(axis=1)
-                    .T.rolling(trailing)
-                    .sum()
+                    .mean()
                     .T,
                     self._balance_sheet_statement.loc[:, "Intangible Assets", :]
                     .T.rolling(trailing)
-                    .sum()
-                    .T,
-                    self._balance_sheet_statement.loc[:, "Total Liabilities", :]
-                    .shift(axis=1)
-                    .T.rolling(trailing)
-                    .sum()
+                    .mean()
                     .T,
                     self._balance_sheet_statement.loc[:, "Total Liabilities", :]
                     .T.rolling(trailing)
-                    .sum()
+                    .mean()
                     .T,
                 )
             )
@@ -3300,18 +3277,18 @@ class Ratios:
             return_on_tangible_assets = (
                 profitability_model.get_return_on_tangible_assets(
                     self._income_statement.loc[:, "Net Income", :],
-                    self._balance_sheet_statement.loc[:, "Total Assets", :].shift(
-                        axis=1
-                    ),
-                    self._balance_sheet_statement.loc[:, "Total Assets", :],
-                    self._balance_sheet_statement.loc[:, "Intangible Assets", :].shift(
-                        axis=1
-                    ),
-                    self._balance_sheet_statement.loc[:, "Intangible Assets", :],
-                    self._balance_sheet_statement.loc[:, "Total Liabilities", :].shift(
-                        axis=1
-                    ),
-                    self._balance_sheet_statement.loc[:, "Total Liabilities", :],
+                    self._balance_sheet_statement.loc[:, "Total Assets", :]
+                    .T.rolling(2)
+                    .mean()
+                    .T,
+                    self._balance_sheet_statement.loc[:, "Intangible Assets", :]
+                    .T.rolling(2)
+                    .mean()
+                    .T,
+                    self._balance_sheet_statement.loc[:, "Total Liabilities", :]
+                    .T.rolling(2)
+                    .mean()
+                    .T,
                 )
             )
 
@@ -3324,6 +3301,7 @@ class Ratios:
 
         return return_on_tangible_assets.round(rounding if rounding else self._rounding)
 
+    @handle_portfolio
     @handle_errors
     def get_return_on_capital_employed(
         self,
@@ -3385,11 +3363,11 @@ class Ratios:
                     .T,
                     self._balance_sheet_statement.loc[:, "Total Assets", :]
                     .T.rolling(trailing)
-                    .sum()
+                    .mean()
                     .T,
                     self._balance_sheet_statement.loc[:, "Total Current Liabilities", :]
                     .T.rolling(trailing)
-                    .sum()
+                    .mean()
                     .T,
                 )
             )
@@ -3417,6 +3395,7 @@ class Ratios:
             rounding if rounding else self._rounding
         )
 
+    @handle_portfolio
     @handle_errors
     def get_net_income_per_ebt(
         self,
@@ -3489,6 +3468,7 @@ class Ratios:
 
         return net_income_per_ebt.round(rounding if rounding else self._rounding)
 
+    @handle_portfolio
     @handle_errors
     def get_free_cash_flow_operating_cash_flow_ratio(
         self,
@@ -3566,6 +3546,7 @@ class Ratios:
             rounding if rounding else self._rounding
         )
 
+    @handle_portfolio
     @handle_errors
     def get_tax_burden_ratio(
         self,
@@ -3639,6 +3620,7 @@ class Ratios:
 
         return tax_burden_ratio.round(rounding if rounding else self._rounding)
 
+    @handle_portfolio
     @handle_errors
     def get_EBT_to_EBIT(
         self,
@@ -3725,6 +3707,7 @@ class Ratios:
 
         return EBT_to_EBIT.round(rounding if rounding else self._rounding)
 
+    @handle_portfolio
     @handle_errors
     def get_EBIT_to_revenue(
         self,
@@ -3863,8 +3846,8 @@ class Ratios:
         solvency_ratios["Net-Debt to EBITDA Ratio"] = self.get_net_debt_to_ebitda_ratio(
             trailing=trailing
         )
-        solvency_ratios["Cash Flow Coverage Ratio"] = self.get_free_cash_flow_yield(
-            diluted=diluted, trailing=trailing
+        solvency_ratios["Cash Flow Coverage Ratio"] = self.get_cash_flow_coverage_ratio(
+            trailing=trailing
         )
         solvency_ratios["CAPEX Coverage Ratio"] = self.get_capex_coverage_ratio(
             trailing=trailing
@@ -3879,6 +3862,8 @@ class Ratios:
             .sort_index(level=0, sort_remaining=False)
             .dropna(axis="columns", how="all")
         )
+
+        self._solvency_ratios = self._solvency_ratios.loc[self._tickers]
 
         self._solvency_ratios = self._solvency_ratios.round(
             rounding if rounding else self._rounding
@@ -3910,6 +3895,7 @@ class Ratios:
 
         return self._solvency_ratios_growth if growth else self._solvency_ratios
 
+    @handle_portfolio
     @handle_errors
     def get_debt_to_assets_ratio(
         self,
@@ -3960,11 +3946,11 @@ class Ratios:
             debt_to_assets_ratio = solvency_model.get_debt_to_assets_ratio(
                 self._balance_sheet_statement.loc[:, "Total Debt", :]
                 .T.rolling(trailing)
-                .sum()
+                .mean()
                 .T,
                 self._balance_sheet_statement.loc[:, "Total Assets", :]
                 .T.rolling(trailing)
-                .sum()
+                .mean()
                 .T,
             )
         else:
@@ -3982,6 +3968,7 @@ class Ratios:
 
         return debt_to_assets_ratio.round(rounding if rounding else self._rounding)
 
+    @handle_portfolio
     @handle_errors
     def get_debt_to_equity_ratio(
         self,
@@ -4033,11 +4020,11 @@ class Ratios:
             debt_to_equity_ratio = solvency_model.get_debt_to_equity_ratio(
                 self._balance_sheet_statement.loc[:, "Total Debt", :]
                 .T.rolling(trailing)
-                .sum()
+                .mean()
                 .T,
                 self._balance_sheet_statement.loc[:, "Total Equity", :]
                 .T.rolling(trailing)
-                .sum()
+                .mean()
                 .T,
             )
         else:
@@ -4055,6 +4042,7 @@ class Ratios:
 
         return debt_to_equity_ratio.round(rounding if rounding else self._rounding)
 
+    @handle_portfolio
     @handle_errors
     def get_interest_coverage_ratio(
         self,
@@ -4107,7 +4095,7 @@ class Ratios:
                 .T.rolling(trailing)
                 .sum()
                 .T,
-                self._income_statement.loc[:, "Depreciation and Amortization", :]
+                self._cash_flow_statement.loc[:, "Depreciation and Amortization", :]
                 .T.rolling(trailing)
                 .sum()
                 .T,
@@ -4119,7 +4107,7 @@ class Ratios:
         else:
             interest_coverage_ratio = solvency_model.get_interest_coverage_ratio(
                 self._income_statement.loc[:, "Operating Income", :],
-                self._income_statement.loc[:, "Depreciation and Amortization", :],
+                self._cash_flow_statement.loc[:, "Depreciation and Amortization", :],
                 self._income_statement.loc[:, "Interest Expense", :],
             )
 
@@ -4132,6 +4120,7 @@ class Ratios:
 
         return interest_coverage_ratio.round(rounding if rounding else self._rounding)
 
+    @handle_portfolio
     @handle_errors
     def get_equity_multiplier(
         self,
@@ -4181,30 +4170,24 @@ class Ratios:
         if trailing:
             equity_multiplier = solvency_model.get_equity_multiplier(
                 self._balance_sheet_statement.loc[:, "Total Assets", :]
-                .shift(axis=1)
                 .T.rolling(trailing)
-                .sum()
-                .T,
-                self._balance_sheet_statement.loc[:, "Total Assets", :]
-                .T.rolling(trailing)
-                .sum()
-                .T,
-                self._balance_sheet_statement.loc[:, "Total Equity", :]
-                .shift(axis=1)
-                .T.rolling(trailing)
-                .sum()
+                .mean()
                 .T,
                 self._balance_sheet_statement.loc[:, "Total Equity", :]
                 .T.rolling(trailing)
-                .sum()
+                .mean()
                 .T,
             )
         else:
             equity_multiplier = solvency_model.get_equity_multiplier(
-                self._balance_sheet_statement.loc[:, "Total Assets", :].shift(axis=1),
-                self._balance_sheet_statement.loc[:, "Total Assets", :],
-                self._balance_sheet_statement.loc[:, "Total Equity", :].shift(axis=1),
-                self._balance_sheet_statement.loc[:, "Total Equity", :],
+                self._balance_sheet_statement.loc[:, "Total Assets", :]
+                .T.rolling(2)
+                .mean()
+                .T,
+                self._balance_sheet_statement.loc[:, "Total Equity", :]
+                .T.rolling(2)
+                .mean()
+                .T,
             )
 
         if growth:
@@ -4216,6 +4199,7 @@ class Ratios:
 
         return equity_multiplier.round(rounding if rounding else self._rounding)
 
+    @handle_portfolio
     @handle_errors
     def get_debt_service_coverage_ratio(
         self,
@@ -4270,7 +4254,7 @@ class Ratios:
                     .T,
                     self._balance_sheet_statement.loc[:, "Total Current Liabilities", :]
                     .T.rolling(trailing)
-                    .sum()
+                    .mean()
                     .T,
                 )
             )
@@ -4295,9 +4279,11 @@ class Ratios:
             rounding if rounding else self._rounding
         )
 
+    @handle_portfolio
     @handle_errors
     def get_free_cash_flow_yield(
         self,
+        show_daily: bool = False,
         diluted: bool = True,
         rounding: int | None = None,
         growth: bool = False,
@@ -4317,6 +4303,7 @@ class Ratios:
         - Free Cash Flow Yield Ratio = Free Cash Flow / Market Capitalization
 
         Args:
+            show_daily (bool, optional): Whether to use daily data for the calculation. Defaults to False.
             diluted (bool, optional): Whether to use diluted shares for market capitalization. Defaults to True.
             rounding (int, optional): The number of decimals to round the results to. Defaults to 4.
             growth (bool, optional): Whether to calculate the growth of the ratios. Defaults to False.
@@ -4341,18 +4328,37 @@ class Ratios:
         free_cash_flow_yield_ratios = toolkit.ratios.get_free_cash_flow_yield()
         ```
         """
-        years = self._balance_sheet_statement.columns
-        begin, end = str(years[0]), str(years[-1])
-
-        share_prices = self._historical_data.loc[begin:end, "Adj Close"][
-            self._tickers
-        ].T
-
         average_shares = (
             self._income_statement.loc[:, "Weighted Average Shares Diluted", :]
             if diluted
             else self._income_statement.loc[:, "Weighted Average Shares", :]
         )
+
+        free_cash_flow = self._cash_flow_statement.loc[:, "Free Cash Flow", :]
+
+        years = self._balance_sheet_statement.columns
+        begin, end = str(years[0]), str(years[-1])
+
+        if show_daily:
+            share_prices = self._daily_historical_data.loc[begin:, "Adj Close"][
+                self._tickers_without_portfolio
+            ]
+
+            average_shares = map_period_data_to_daily_data(
+                period_data=average_shares,
+                daily_dates=share_prices.index,
+                quarterly=self._quarterly,
+            )
+
+            free_cash_flow = map_period_data_to_daily_data(
+                period_data=free_cash_flow,
+                daily_dates=share_prices.index,
+                quarterly=self._quarterly,
+            )
+        else:
+            share_prices = self._historical_data.loc[begin:end, "Adj Close"][
+                self._tickers_without_portfolio
+            ].T
 
         if trailing:
             market_cap = valuation_model.get_market_cap(
@@ -4361,17 +4367,14 @@ class Ratios:
             )
 
             free_cash_flow_yield = solvency_model.get_free_cash_flow_yield(
-                self._cash_flow_statement.loc[:, "Free Cash Flow", :]
-                .T.rolling(trailing)
-                .sum()
-                .T,
+                free_cash_flow.T.rolling(trailing).sum().T,
                 market_cap,
             )
         else:
             market_cap = valuation_model.get_market_cap(share_prices, average_shares)
 
             free_cash_flow_yield = solvency_model.get_free_cash_flow_yield(
-                self._cash_flow_statement.loc[:, "Free Cash Flow", :],
+                free_cash_flow,
                 market_cap,
             )
 
@@ -4384,6 +4387,7 @@ class Ratios:
 
         return free_cash_flow_yield.round(rounding if rounding else self._rounding)
 
+    @handle_portfolio
     @handle_errors
     def get_net_debt_to_ebitda_ratio(
         self,
@@ -4434,19 +4438,19 @@ class Ratios:
                 .T.rolling(trailing)
                 .sum()
                 .T,
-                self._income_statement.loc[:, "Depreciation and Amortization", :]
+                self._cash_flow_statement.loc[:, "Depreciation and Amortization", :]
                 .T.rolling(trailing)
                 .sum()
                 .T,
                 self._balance_sheet_statement.loc[:, "Net Debt", :]
                 .T.rolling(trailing)
-                .sum()
+                .mean()
                 .T,
             )
         else:
             net_debt_to_ebitda_ratio = solvency_model.get_net_debt_to_ebitda_ratio(
                 self._income_statement.loc[:, "Operating Income", :],
-                self._income_statement.loc[:, "Depreciation and Amortization", :],
+                self._cash_flow_statement.loc[:, "Depreciation and Amortization", :],
                 self._balance_sheet_statement.loc[:, "Net Debt", :],
             )
 
@@ -4459,6 +4463,7 @@ class Ratios:
 
         return net_debt_to_ebitda_ratio.round(rounding if rounding else self._rounding)
 
+    @handle_portfolio
     @handle_errors
     def get_cash_flow_coverage_ratio(
         self,
@@ -4511,7 +4516,7 @@ class Ratios:
                 .T,
                 self._balance_sheet_statement.loc[:, "Total Debt", :]
                 .T.rolling(trailing)
-                .sum()
+                .mean()
                 .T,
             )
         else:
@@ -4529,6 +4534,7 @@ class Ratios:
 
         return cash_flow_coverage_ratio.round(rounding if rounding else self._rounding)
 
+    @handle_portfolio
     @handle_errors
     def get_capex_coverage_ratio(
         self,
@@ -4601,6 +4607,7 @@ class Ratios:
 
         return capex_coverage_ratio.round(rounding if rounding else self._rounding)
 
+    @handle_portfolio
     @handle_errors
     def get_capex_dividend_coverage_ratio(
         self,
@@ -4733,12 +4740,12 @@ class Ratios:
         valuation_ratios["Revenue per Share"] = self.get_revenue_per_share(
             diluted=diluted, trailing=trailing
         )
-        valuation_ratios["Price-to-Earnings"] = self.get_price_earnings_ratio(
-            include_dividends=include_dividends, diluted=diluted, trailing=trailing
+        valuation_ratios["Price-to-Earnings"] = self.get_price_to_earnings_ratio(
+            include_dividends=include_dividends, diluted=diluted
         )
         valuation_ratios["Price-to-Earnings-Growth"] = (
             self.get_price_to_earnings_growth_ratio(
-                include_dividends=include_dividends, diluted=diluted, trailing=trailing
+                include_dividends=include_dividends, diluted=diluted
             )
         )
         valuation_ratios["Book Value per Share"] = self.get_book_value_per_share(
@@ -4811,6 +4818,8 @@ class Ratios:
             .dropna(axis="columns", how="all")
         )
 
+        self._valuation_ratios = self._valuation_ratios.loc[self._tickers]
+
         self._valuation_ratios = self._valuation_ratios.round(
             rounding if rounding else self._rounding
         )
@@ -4843,6 +4852,7 @@ class Ratios:
 
         return self._valuation_ratios_growth if growth else self._valuation_ratios
 
+    @handle_portfolio
     @handle_errors
     def get_earnings_per_share(
         self,
@@ -4939,6 +4949,7 @@ class Ratios:
 
         return earnings_per_share.round(rounding if rounding else self._rounding)
 
+    @handle_portfolio
     @handle_errors
     def get_revenue_per_share(
         self,
@@ -5012,15 +5023,16 @@ class Ratios:
 
         return revenue_per_share.round(rounding if rounding else self._rounding)
 
+    @handle_portfolio
     @handle_errors
-    def get_price_earnings_ratio(
+    def get_price_to_earnings_ratio(
         self,
+        show_daily: bool = False,
         include_dividends: bool = False,
         diluted: bool = True,
         rounding: int | None = None,
         growth: bool = False,
         lag: int | list[int] = 1,
-        trailing: int | None = None,
     ):
         """
         Calculate the price earnings ratio (P/E), a valuation ratio that compares a
@@ -5033,7 +5045,7 @@ class Ratios:
 
         The formula is as follows:
 
-        - Price Earnings Ratio (P/E) = Share Price / Earnings per Share (EPS)
+        - Price to Earnings Ratio (P/E) = Share Price / Earnings per Share (EPS)
 
         Args:
             include_dividends (bool, optional): Whether to include dividends in the calculation. Defaults to False.
@@ -5041,8 +5053,6 @@ class Ratios:
             rounding (int, optional): The number of decimals to round the results to. Defaults to 4.
             growth (bool, optional): Whether to calculate the growth of the ratios. Defaults to False.
             lag (int | str, optional): The lag to use for the growth calculation. Defaults to 1.
-            trailing (int): Defines whether to select a trailing period.
-            E.g. when selecting 4 with quarterly data, the TTM is calculated.
 
         Returns:
             pd.DataFrame: Price earnings ratio (P/E) values.
@@ -5058,42 +5068,54 @@ class Ratios:
 
         toolkit = Toolkit(["AAPL", "TSLA"], api_key="FINANCIAL_MODELING_PREP_KEY")
 
-        pe_ratio = toolkit.ratios.get_price_earnings_ratio()
+        pe_ratio = toolkit.ratios.get_price_to_earnings_ratio()
         ```
         """
         eps = self.get_earnings_per_share(
-            include_dividends, diluted, trailing=trailing if trailing else None
+            include_dividends, diluted, trailing=4 if self._quarterly else None
         )
 
         years = eps.columns
         begin, end = str(years[0]), str(years[-1])
 
-        share_prices = self._historical_data.loc[begin:end, "Adj Close"][
-            self._tickers
-        ].T
+        if show_daily:
+            share_prices = self._daily_historical_data.loc[begin:, "Adj Close"][
+                self._tickers_without_portfolio
+            ]
 
-        price_earnings_ratio = valuation_model.get_price_earnings_ratio(
+            eps = map_period_data_to_daily_data(
+                period_data=eps,
+                daily_dates=share_prices.index,
+                quarterly=self._quarterly,
+            )
+        else:
+            share_prices = self._historical_data.loc[begin:end, "Adj Close"][
+                self._tickers_without_portfolio
+            ].T
+
+        price_to_earnings_ratio = valuation_model.get_price_to_earnings_ratio(
             share_prices, eps
         )
 
         if growth:
             return calculate_growth(
-                price_earnings_ratio,
+                price_to_earnings_ratio,
                 lag=lag,
                 rounding=rounding if rounding else self._rounding,
             )
 
-        return price_earnings_ratio.round(rounding if rounding else self._rounding)
+        return price_to_earnings_ratio.round(rounding if rounding else self._rounding)
 
+    @handle_portfolio
     @handle_errors
     def get_price_to_earnings_growth_ratio(
         self,
+        use_ebitda_growth_rate: bool = False,
         include_dividends: bool = False,
         diluted: bool = True,
         rounding: int | None = None,
         growth: bool = False,
         lag: int | list[int] = 1,
-        trailing: int | None = None,
     ):
         """
         Calculate the price earnings to growth (PEG) ratio, a valuation metric that
@@ -5106,9 +5128,11 @@ class Ratios:
 
         The formula is as follows:
 
-        - Price Earnings to Growth Ratio (PEG) = Price Earnings Ratio (P/E) / Earnings per Share Growth
+        - Price Earnings to Growth Ratio (PEG) = Price Earnings Ratio (P/E) / Growth Rate
 
         Args:
+            use_ebitda_growth_rate (bool, optional): Whether to use EBITDA growth rate for the calculation.
+                Defaults to False.
             include_dividends (bool, optional): Whether to include dividends in the calculation. Defaults to False.
             diluted (bool, optional): Whether to use diluted shares in the calculation. Defaults to True.
             rounding (int, optional): The number of decimals to round the results to. Defaults to 4.
@@ -5134,19 +5158,32 @@ class Ratios:
         peg_ratio = toolkit.ratios.get_price_to_earnings_growth_ratio()
         ```
         """
-        eps_growth = self.get_earnings_per_share(
-            include_dividends,
-            diluted=diluted,
-            growth=True,
-            trailing=trailing if trailing else None,
-        )
-        price_earnings = self.get_price_earnings_ratio(
-            include_dividends, diluted=diluted, trailing=trailing if trailing else None
+        trailing_metric = 5 * 4 if self._quarterly else 5
+
+        if use_ebitda_growth_rate:
+            growth_rate = (
+                self._income_statement.loc[:, "EBITDA", :]
+                .T.rolling(trailing_metric)
+                .sum()
+                .T
+            )
+
+            growth_rate = calculate_growth(growth_rate)
+        else:
+            growth_rate = self.get_earnings_per_share(
+                include_dividends,
+                diluted=diluted,
+                growth=True,
+                trailing=trailing_metric,
+            )
+
+        price_earnings = self.get_price_to_earnings_ratio(
+            include_dividends, diluted=diluted
         )
 
         price_to_earnings_growth_ratio = (
             valuation_model.get_price_to_earnings_growth_ratio(
-                price_earnings, eps_growth
+                price_earnings, growth_rate * 100
             )
         )
 
@@ -5161,6 +5198,7 @@ class Ratios:
             rounding if rounding else self._rounding
         )
 
+    @handle_portfolio
     @handle_errors
     def get_book_value_per_share(
         self,
@@ -5218,13 +5256,13 @@ class Ratios:
             book_value_per_share = valuation_model.get_book_value_per_share(
                 self._balance_sheet_statement.loc[:, "Total Shareholder Equity", :]
                 .T.rolling(trailing)
-                .sum()
+                .mean()
                 .T,
                 self._balance_sheet_statement.loc[:, "Preferred Stock", :]
                 .T.rolling(trailing)
-                .sum()
+                .mean()
                 .T,
-                average_shares,
+                average_shares.T.rolling(trailing).mean().T,
             )
         else:
             book_value_per_share = valuation_model.get_book_value_per_share(
@@ -5242,9 +5280,11 @@ class Ratios:
 
         return book_value_per_share.round(rounding if rounding else self._rounding)
 
+    @handle_portfolio
     @handle_errors
     def get_price_to_book_ratio(
         self,
+        show_daily: bool = False,
         diluted: bool = True,
         rounding: int | None = None,
         growth: bool = False,
@@ -5297,9 +5337,20 @@ class Ratios:
         years = book_value_per_share.columns
         begin, end = str(years[0]), str(years[-1])
 
-        share_prices = self._historical_data.loc[begin:end, "Adj Close"][
-            self._tickers
-        ].T
+        if show_daily:
+            share_prices = self._daily_historical_data.loc[begin:, "Adj Close"][
+                self._tickers_without_portfolio
+            ]
+
+            book_value_per_share = map_period_data_to_daily_data(
+                period_data=book_value_per_share,
+                daily_dates=share_prices.index,
+                quarterly=self._quarterly,
+            )
+        else:
+            share_prices = self._historical_data.loc[begin:end, "Adj Close"][
+                self._tickers_without_portfolio
+            ].T
 
         price_to_book_ratio = valuation_model.get_price_to_book_ratio(
             share_prices, book_value_per_share
@@ -5314,6 +5365,7 @@ class Ratios:
 
         return price_to_book_ratio.round(rounding if rounding else self._rounding)
 
+    @handle_portfolio
     @handle_errors
     def get_interest_debt_per_share(
         self,
@@ -5376,9 +5428,9 @@ class Ratios:
                 .T,
                 self._balance_sheet_statement.loc[:, "Total Debt", :]
                 .T.rolling(trailing)
-                .sum()
+                .mean()
                 .T,
-                average_shares,
+                average_shares.T.rolling(trailing).mean().T,
             )
         else:
             interest_debt_per_share = valuation_model.get_interest_debt_per_share(
@@ -5396,6 +5448,7 @@ class Ratios:
 
         return interest_debt_per_share.round(rounding if rounding else self._rounding)
 
+    @handle_portfolio
     @handle_errors
     def get_capex_per_share(
         self,
@@ -5473,9 +5526,11 @@ class Ratios:
 
         return capex_per_share.round(rounding if rounding else self._rounding)
 
+    @handle_portfolio
     @handle_errors
     def get_dividend_yield(
         self,
+        show_daily: bool = False,
         rounding: int | None = None,
         growth: bool = False,
         lag: int | list[int] = 1,
@@ -5494,6 +5549,7 @@ class Ratios:
         - Dividend Yield = Dividends per Share / Share Price
 
         Args:
+            show_daily (bool, optional): Whether to show daily data. Defaults to False.
             rounding (int, optional): The number of decimals to round the results to. Defaults to 4.
             growth (bool, optional): Whether to calculate the growth of the ratios. Defaults to False.
             lag (int | str, optional): The lag to use for the growth calculation. Defaults to 1.
@@ -5519,8 +5575,20 @@ class Ratios:
         dividend_yield = toolkit.ratios.get_dividend_yield()
         ```
         """
-        share_prices = self._historical_data.loc[:, "Adj Close"][self._tickers].T
-        dividends = self._historical_data.loc[:, "Dividends"][self._tickers].T
+        if show_daily:
+            share_prices = self._daily_historical_data.loc[:, "Adj Close"][
+                self._tickers_without_portfolio
+            ]
+            dividends = self._daily_historical_data.loc[:, "Dividends"][
+                self._tickers_without_portfolio
+            ]
+        else:
+            share_prices = self._historical_data.loc[:, "Adj Close"][
+                self._tickers_without_portfolio
+            ].T
+            dividends = self._historical_data.loc[:, "Dividends"][
+                self._tickers_without_portfolio
+            ].T
 
         dividend_yield = valuation_model.get_dividend_yield(
             dividends.T.rolling(trailing).sum().T if trailing else dividends,
@@ -5536,9 +5604,11 @@ class Ratios:
 
         return dividend_yield.round(rounding if rounding else self._rounding)
 
+    @handle_portfolio
     @handle_errors
     def get_weighted_dividend_yield(
         self,
+        show_daily: bool = False,
         diluted: bool = True,
         rounding: int | None = None,
         growth: bool = False,
@@ -5558,6 +5628,7 @@ class Ratios:
         - Weighted Dividend Yield = Dividends Paid / Weighted Average (Diluted) Shares * Share Price
 
         Args:
+            show_daily (bool, optional): Whether to show daily data. Defaults to False.
             diluted (bool, optional): Whether to use diluted shares in the calculation. Defaults to True.
             rounding (int, optional): The number of decimals to round the results to. Defaults to 4.
             growth (bool, optional): Whether to calculate the growth of the ratios. Defaults to False.
@@ -5590,25 +5661,41 @@ class Ratios:
             else self._income_statement.loc[:, "Weighted Average Shares", :]
         )
 
+        dividends_paid = abs(self._cash_flow_statement.loc[:, "Dividends Paid", :])
+
         years = self._cash_flow_statement.columns
         begin, end = str(years[0]), str(years[-1])
 
-        share_prices = self._historical_data.loc[begin:end, "Adj Close"][
-            self._tickers
-        ].T
+        if show_daily:
+            share_prices = self._daily_historical_data.loc[begin:, "Adj Close"][
+                self._tickers_without_portfolio
+            ]
+
+            average_shares = map_period_data_to_daily_data(
+                period_data=average_shares,
+                daily_dates=share_prices.index,
+                quarterly=self._quarterly,
+            )
+
+            dividends_paid = map_period_data_to_daily_data(
+                period_data=dividends_paid,
+                daily_dates=share_prices.index,
+                quarterly=self._quarterly,
+            )
+        else:
+            share_prices = self._historical_data.loc[begin:end, "Adj Close"][
+                self._tickers_without_portfolio
+            ].T
 
         if trailing:
             weighted_dividend_yield = valuation_model.get_weighted_dividend_yield(
-                abs(self._cash_flow_statement.loc[:, "Dividends Paid", :])
-                .T.rolling(trailing)
-                .sum()
-                .T,
+                dividends_paid.T.rolling(trailing).sum().T,
                 average_shares,
                 share_prices,
             )
         else:
             weighted_dividend_yield = valuation_model.get_weighted_dividend_yield(
-                abs(self._cash_flow_statement.loc[:, "Dividends Paid", :]),
+                dividends_paid,
                 average_shares,
                 share_prices,
             )
@@ -5622,9 +5709,11 @@ class Ratios:
 
         return weighted_dividend_yield.round(rounding if rounding else self._rounding)
 
+    @handle_portfolio
     @handle_errors
     def get_price_to_cash_flow_ratio(
         self,
+        show_daily: bool = False,
         diluted: bool = True,
         rounding: int | None = None,
         growth: bool = False,
@@ -5644,6 +5733,7 @@ class Ratios:
         - Price to Cash Flow Ratio = Share Price / Cash Flow from Operations per Share
 
         Args:
+            show_daily (bool, optional): Whether to show daily data. Defaults to False.
             diluted (bool, optional): Whether to use diluted shares in the calculation. Defaults to True.
             rounding (int, optional): The number of decimals to round the results to. Defaults to 4.
             growth (bool, optional): Whether to calculate the growth of the ratios. Defaults to False.
@@ -5676,27 +5766,44 @@ class Ratios:
             else self._income_statement.loc[:, "Weighted Average Shares", :]
         )
 
+        cash_flow_from_operations = self._cash_flow_statement.loc[
+            :, "Cash Flow from Operations", :
+        ]
+
         years = self._cash_flow_statement.columns
         begin, end = str(years[0]), str(years[-1])
 
-        share_prices = self._historical_data.loc[begin:end, "Adj Close"][
-            self._tickers
-        ].T
+        if show_daily:
+            share_prices = self._daily_historical_data.loc[begin:, "Adj Close"][
+                self._tickers_without_portfolio
+            ]
+
+            average_shares = map_period_data_to_daily_data(
+                period_data=average_shares,
+                daily_dates=share_prices.index,
+                quarterly=self._quarterly,
+            )
+
+            cash_flow_from_operations = map_period_data_to_daily_data(
+                period_data=cash_flow_from_operations,
+                daily_dates=share_prices.index,
+                quarterly=self._quarterly,
+            )
+        else:
+            share_prices = self._historical_data.loc[begin:end, "Adj Close"][
+                self._tickers_without_portfolio
+            ].T
 
         market_cap = valuation_model.get_market_cap(share_prices, average_shares)
 
         if trailing:
             price_to_cash_flow_ratio = valuation_model.get_price_to_cash_flow_ratio(
                 market_cap,
-                self._cash_flow_statement.loc[:, "Cash Flow from Operations", :]
-                .T.rolling(trailing)
-                .sum()
-                .T,
+                cash_flow_from_operations.T.rolling(trailing).sum().T,
             )
         else:
             price_to_cash_flow_ratio = valuation_model.get_price_to_cash_flow_ratio(
-                market_cap,
-                self._cash_flow_statement.loc[:, "Cash Flow from Operations", :],
+                market_cap, cash_flow_from_operations
             )
 
         if growth:
@@ -5708,9 +5815,11 @@ class Ratios:
 
         return price_to_cash_flow_ratio.round(rounding if rounding else self._rounding)
 
+    @handle_portfolio
     @handle_errors
     def get_price_to_free_cash_flow_ratio(
         self,
+        show_daily: bool = False,
         diluted: bool = True,
         rounding: int | None = None,
         growth: bool = False,
@@ -5728,6 +5837,7 @@ class Ratios:
         - Price to Free Cash Flow Ratio = Market Cap / Free Cash Flow
 
         Args:
+            show_daily (bool, optional): Whether to show daily data. Defaults to False.
             diluted (bool, optional): Whether to use diluted shares in the calculation. Defaults to True.
             rounding (int, optional): The number of decimals to round the results to. Defaults to 4.
             growth (bool, optional): Whether to calculate the growth of the ratios. Defaults to False.
@@ -5755,23 +5865,31 @@ class Ratios:
         ```
         """
         market_cap = self.get_market_cap(
-            diluted=diluted, trailing=trailing if trailing else None
+            diluted=diluted,
+            trailing=trailing if trailing else None,
+            show_daily=show_daily,
         )
+
+        free_cash_flow = self._cash_flow_statement.loc[:, "Free Cash Flow", :]
+
+        if show_daily:
+            free_cash_flow = map_period_data_to_daily_data(
+                period_data=free_cash_flow,
+                daily_dates=market_cap.index,
+                quarterly=self._quarterly,
+            )
 
         if trailing:
             price_to_free_cash_flow_ratio = (
                 valuation_model.get_price_to_free_cash_flow_ratio(
                     market_cap,
-                    self._cash_flow_statement.loc[:, "Free Cash Flow", :]
-                    .T.rolling(trailing)
-                    .sum()
-                    .T,
+                    free_cash_flow.T.rolling(trailing).sum().T,
                 )
             )
         else:
             price_to_free_cash_flow_ratio = (
                 valuation_model.get_price_to_free_cash_flow_ratio(
-                    market_cap, self._cash_flow_statement.loc[:, "Free Cash Flow", :]
+                    market_cap, free_cash_flow
                 )
             )
 
@@ -5786,9 +5904,11 @@ class Ratios:
             rounding if rounding else self._rounding
         )
 
+    @handle_portfolio
     @handle_errors
     def get_market_cap(
         self,
+        show_daily: bool = False,
         diluted: bool = True,
         rounding: int | None = None,
         growth: bool = False,
@@ -5807,6 +5927,7 @@ class Ratios:
         - Market Capitalization = Share Price * Weighted Average (Diluted) Shares
 
         Args:
+            show_daily (bool, optional): Whether to show daily data. Defaults to False.
             diluted (bool, optional): Whether to use diluted shares in the calculation. Defaults to True.
             rounding (int, optional): The number of decimals to round the results to. Defaults to 4.
             growth (bool, optional): Whether to calculate the growth of the ratios. Defaults to False.
@@ -5836,9 +5957,20 @@ class Ratios:
         years = self._cash_flow_statement.columns
         begin, end = str(years[0]), str(years[-1])
 
-        share_prices = self._historical_data.loc[begin:end, "Adj Close"][
-            self._tickers
-        ].T
+        if show_daily:
+            share_prices = self._daily_historical_data.loc[begin:, "Adj Close"][
+                self._tickers_without_portfolio
+            ]
+
+            average_shares = map_period_data_to_daily_data(
+                period_data=average_shares,
+                daily_dates=share_prices.index,
+                quarterly=self._quarterly,
+            )
+        else:
+            share_prices = self._historical_data.loc[begin:end, "Adj Close"][
+                self._tickers_without_portfolio
+            ].T
 
         if trailing:
             market_cap = valuation_model.get_market_cap(
@@ -5855,9 +5987,11 @@ class Ratios:
 
         return market_cap.round(rounding if rounding else self._rounding)
 
+    @handle_portfolio
     @handle_errors
     def get_enterprise_value(
         self,
+        show_daily: bool = False,
         diluted: bool = True,
         rounding: int | None = None,
         growth: bool = False,
@@ -5877,6 +6011,7 @@ class Ratios:
             — Cash and Cash Equivalents
 
         Args:
+            show_daily (bool, optional): Whether to show daily data. Defaults to False.
             diluted (bool, optional): Whether to use diluted shares in the calculation. Defaults to True.
             rounding (int, optional): The number of decimals to round the results to. Defaults to 4.
             growth (bool, optional): Whether to calculate the growth of the ratios. Defaults to False.
@@ -5897,37 +6032,59 @@ class Ratios:
         enterprise_value = toolkit.ratios.get_enterprise_value()
         ```
         """
+        total_debt = self._balance_sheet_statement.loc[:, "Total Debt", :]
+        minority_interest = self._balance_sheet_statement.loc[:, "Minority Interest", :]
+        preferred_stock = self._balance_sheet_statement.loc[:, "Preferred Stock", :]
+        cash_and_cash_equivalents = self._balance_sheet_statement.loc[
+            :, "Cash and Cash Equivalents", :
+        ]
+
         market_cap = self.get_market_cap(
-            diluted=diluted, trailing=trailing if trailing else None
+            diluted=diluted,
+            trailing=trailing if trailing else None,
+            show_daily=show_daily,
         )
+
+        if show_daily:
+            total_debt = map_period_data_to_daily_data(
+                period_data=total_debt,
+                daily_dates=market_cap.index,
+                quarterly=self._quarterly,
+            )
+
+            minority_interest = map_period_data_to_daily_data(
+                period_data=minority_interest,
+                daily_dates=market_cap.index,
+                quarterly=self._quarterly,
+            )
+
+            preferred_stock = map_period_data_to_daily_data(
+                period_data=preferred_stock,
+                daily_dates=market_cap.index,
+                quarterly=self._quarterly,
+            )
+
+            cash_and_cash_equivalents = map_period_data_to_daily_data(
+                period_data=cash_and_cash_equivalents,
+                daily_dates=market_cap.index,
+                quarterly=self._quarterly,
+            )
 
         if trailing:
             enterprise_value = valuation_model.get_enterprise_value(
                 market_cap,
-                self._balance_sheet_statement.loc[:, "Total Debt", :]
-                .T.rolling(trailing)
-                .sum()
-                .T,
-                self._balance_sheet_statement.loc[:, "Minority Interest", :]
-                .T.rolling(trailing)
-                .sum()
-                .T,
-                self._balance_sheet_statement.loc[:, "Preferred Stock", :]
-                .T.rolling(trailing)
-                .sum()
-                .T,
-                self._balance_sheet_statement.loc[:, "Cash and Cash Equivalents", :]
-                .T.rolling(trailing)
-                .sum()
-                .T,
+                total_debt.T.rolling(trailing).mean().T,
+                minority_interest.T.rolling(trailing).mean().T,
+                preferred_stock.T.rolling(trailing).mean().T,
+                cash_and_cash_equivalents.T.rolling(trailing).mean().T,
             )
         else:
             enterprise_value = valuation_model.get_enterprise_value(
                 market_cap,
-                self._balance_sheet_statement.loc[:, "Total Debt", :],
-                self._balance_sheet_statement.loc[:, "Minority Interest", :],
-                self._balance_sheet_statement.loc[:, "Preferred Stock", :],
-                self._balance_sheet_statement.loc[:, "Cash and Cash Equivalents", :],
+                total_debt,
+                minority_interest,
+                preferred_stock,
+                cash_and_cash_equivalents,
             )
 
         if growth:
@@ -5939,9 +6096,11 @@ class Ratios:
 
         return enterprise_value.round(rounding if rounding else self._rounding)
 
+    @handle_portfolio
     @handle_errors
     def get_ev_to_sales_ratio(
         self,
+        show_daily: bool = False,
         diluted: bool = True,
         rounding: int | None = None,
         growth: bool = False,
@@ -5961,6 +6120,7 @@ class Ratios:
         - Enterprise Value to Sales Ratio = Enterprise Value / Total Revenue
 
         Args:
+            show_daily (bool, optional): Whether to show daily data. Defaults to False.
             diluted (bool, optional): Whether to use diluted shares in the calculation. Defaults to True.
             rounding (int, optional): The number of decimals to round the results to. Defaults to 4.
             growth (bool, optional): Whether to calculate the growth of the ratios. Defaults to False.
@@ -5982,17 +6142,28 @@ class Ratios:
         ```
         """
         enterprise_value = self.get_enterprise_value(
-            diluted=diluted, trailing=trailing if trailing else None
+            diluted=diluted,
+            trailing=trailing if trailing else None,
+            show_daily=show_daily,
         )
+
+        revenue = self._income_statement.loc[:, "Revenue", :]
+
+        if show_daily:
+            revenue = map_period_data_to_daily_data(
+                period_data=revenue,
+                daily_dates=enterprise_value.index,
+                quarterly=self._quarterly,
+            )
 
         if trailing:
             ev_to_sales_ratio = valuation_model.get_ev_to_sales_ratio(
                 enterprise_value,
-                self._income_statement.loc[:, "Revenue", :].T.rolling(trailing).sum().T,
+                revenue.T.rolling(trailing).sum().T,
             )
         else:
             ev_to_sales_ratio = valuation_model.get_ev_to_sales_ratio(
-                enterprise_value, self._income_statement.loc[:, "Revenue", :]
+                enterprise_value, revenue
             )
 
         if growth:
@@ -6004,9 +6175,11 @@ class Ratios:
 
         return ev_to_sales_ratio.round(rounding if rounding else self._rounding)
 
+    @handle_portfolio
     @handle_errors
     def get_ev_to_ebitda_ratio(
         self,
+        show_daily: bool = False,
         diluted: bool = True,
         rounding: int | None = None,
         growth: bool = False,
@@ -6046,26 +6219,38 @@ class Ratios:
         ```
         """
         enterprise_value = self.get_enterprise_value(
-            diluted=diluted, trailing=trailing if trailing else None
+            diluted=diluted,
+            trailing=trailing if trailing else None,
+            show_daily=show_daily,
         )
+
+        operating_income = self._income_statement.loc[:, "Operating Income", :]
+        depreciation_and_amortization = self._cash_flow_statement.loc[
+            :, "Depreciation and Amortization", :
+        ]
+
+        if show_daily:
+            operating_income = map_period_data_to_daily_data(
+                period_data=operating_income,
+                daily_dates=enterprise_value.index,
+                quarterly=self._quarterly,
+            )
+
+            depreciation_and_amortization = map_period_data_to_daily_data(
+                period_data=depreciation_and_amortization,
+                daily_dates=enterprise_value.index,
+                quarterly=self._quarterly,
+            )
 
         if trailing:
             ev_to_ebitda_ratio = valuation_model.get_ev_to_ebitda_ratio(
                 enterprise_value,
-                self._income_statement.loc[:, "Operating Income", :]
-                .T.rolling(trailing)
-                .sum()
-                .T,
-                self._income_statement.loc[:, "Depreciation and Amortization", :]
-                .T.rolling(trailing)
-                .sum()
-                .T,
+                operating_income.T.rolling(trailing).sum().T,
+                depreciation_and_amortization.T.rolling(trailing).sum().T,
             )
         else:
             ev_to_ebitda_ratio = valuation_model.get_ev_to_ebitda_ratio(
-                enterprise_value,
-                self._income_statement.loc[:, "Operating Income", :],
-                self._income_statement.loc[:, "Depreciation and Amortization", :],
+                enterprise_value, operating_income, depreciation_and_amortization
             )
 
         if growth:
@@ -6077,9 +6262,11 @@ class Ratios:
 
         return ev_to_ebitda_ratio.round(rounding if rounding else self._rounding)
 
+    @handle_portfolio
     @handle_errors
     def get_ev_to_operating_cashflow_ratio(
         self,
+        show_daily: bool = False,
         diluted: bool = True,
         rounding: int | None = None,
         growth: bool = False,
@@ -6100,6 +6287,7 @@ class Ratios:
         - Enterprise Value to Operating Cash Flow Ratio = Enterprise Value / Operating Cash Flow
 
         Args:
+            show_daily (bool, optional): Whether to show daily data. Defaults to False.
             diluted (bool, optional): Whether to use diluted shares in the calculation. Defaults to True.
             rounding (int, optional): The number of decimals to round the results to. Defaults to 4.
             growth (bool, optional): Whether to calculate the growth of the ratios. Defaults to False.
@@ -6121,24 +6309,33 @@ class Ratios:
         ```
         """
         enterprise_value = self.get_enterprise_value(
-            diluted=diluted, trailing=trailing if trailing else None
+            diluted=diluted,
+            trailing=trailing if trailing else None,
+            show_daily=show_daily,
         )
+
+        cash_flow_from_operations = self._cash_flow_statement.loc[
+            :, "Cash Flow from Operations", :
+        ]
+
+        if show_daily:
+            cash_flow_from_operations = map_period_data_to_daily_data(
+                period_data=cash_flow_from_operations,
+                daily_dates=enterprise_value.index,
+                quarterly=self._quarterly,
+            )
 
         if trailing:
             ev_to_operating_cashflow_ratio = (
                 valuation_model.get_ev_to_operating_cashflow_ratio(
                     enterprise_value,
-                    self._cash_flow_statement.loc[:, "Cash Flow from Operations", :]
-                    .T.rolling(trailing)
-                    .sum()
-                    .T,
+                    cash_flow_from_operations.T.rolling(trailing).sum().T,
                 )
             )
         else:
             ev_to_operating_cashflow_ratio = (
                 valuation_model.get_ev_to_operating_cashflow_ratio(
-                    enterprise_value,
-                    self._cash_flow_statement.loc[:, "Cash Flow from Operations", :],
+                    enterprise_value, cash_flow_from_operations
                 )
             )
 
@@ -6153,9 +6350,11 @@ class Ratios:
             rounding if rounding else self._rounding
         )
 
+    @handle_portfolio
     @handle_errors
     def get_earnings_yield(
         self,
+        show_daily: bool = False,
         include_dividends: bool = False,
         diluted: bool = True,
         rounding: int | None = None,
@@ -6177,6 +6376,7 @@ class Ratios:
         - Earnings Yield Ratio = Earnings per Share / Share Price
 
         Args:
+            show_daily (bool, optional): Whether to show daily data. Defaults to False.
             include_dividends (bool, optional): Whether to include dividends in the calculation. Defaults to False.
             diluted (bool, optional): Whether to use diluted shares in the calculation. Defaults to True.
             rounding (int, optional): The number of decimals to round the results to. Defaults to 4.
@@ -6205,9 +6405,20 @@ class Ratios:
         years = eps.columns
         begin, end = str(years[0]), str(years[-1])
 
-        share_prices = self._historical_data.loc[begin:end, "Adj Close"][
-            self._tickers
-        ].T
+        if show_daily:
+            share_prices = self._daily_historical_data.loc[begin:, "Adj Close"][
+                self._tickers_without_portfolio
+            ]
+
+            eps = map_period_data_to_daily_data(
+                period_data=eps,
+                daily_dates=share_prices.index,
+                quarterly=self._quarterly,
+            )
+        else:
+            share_prices = self._historical_data.loc[begin:end, "Adj Close"][
+                self._tickers_without_portfolio
+            ].T
 
         earnings_yield = valuation_model.get_earnings_yield(eps, share_prices)
 
@@ -6220,6 +6431,7 @@ class Ratios:
 
         return earnings_yield.round(rounding if rounding else self._rounding)
 
+    @handle_portfolio
     @handle_errors
     def get_dividend_payout_ratio(
         self,
@@ -6286,6 +6498,7 @@ class Ratios:
 
         return payout_ratio.round(rounding if rounding else self._rounding)
 
+    @handle_portfolio
     @handle_errors
     def get_reinvestment_rate(
         self,
@@ -6348,6 +6561,7 @@ class Ratios:
 
         return reinvestment_ratio.round(rounding if rounding else self._rounding)
 
+    @handle_portfolio
     @handle_errors
     def get_tangible_asset_value(
         self,
@@ -6389,15 +6603,15 @@ class Ratios:
             tangible_asset_value = valuation_model.get_tangible_asset_value(
                 self._balance_sheet_statement.loc[:, "Total Assets", :]
                 .T.rolling(trailing)
-                .sum()
+                .mean()
                 .T,
                 self._balance_sheet_statement.loc[:, "Total Liabilities", :]
                 .T.rolling(trailing)
-                .sum()
+                .mean()
                 .T,
                 self._balance_sheet_statement.loc[:, "Goodwill", :]
                 .T.rolling(trailing)
-                .sum()
+                .mean()
                 .T,
             )
         else:
@@ -6416,6 +6630,7 @@ class Ratios:
 
         return tangible_asset_value.round(rounding if rounding else self._rounding)
 
+    @handle_portfolio
     @handle_errors
     def get_net_current_asset_value(
         self,
@@ -6457,11 +6672,11 @@ class Ratios:
             net_current_asset_value = valuation_model.get_net_current_asset_value(
                 self._balance_sheet_statement.loc[:, "Total Current Assets", :]
                 .T.rolling(trailing)
-                .sum()
+                .mean()
                 .T,
                 self._balance_sheet_statement.loc[:, "Total Current Liabilities", :]
                 .T.rolling(trailing)
-                .sum()
+                .mean()
                 .T,
             )
         else:
@@ -6479,9 +6694,11 @@ class Ratios:
 
         return net_current_asset_value.round(rounding if rounding else self._rounding)
 
+    @handle_portfolio
     @handle_errors
     def get_ev_to_ebit(
         self,
+        show_daily: bool = False,
         diluted: bool = True,
         rounding: int | None = None,
         growth: bool = False,
@@ -6498,6 +6715,7 @@ class Ratios:
         - Enterprise Value to EBIT Ratio = Enterprise Value / EBIT
 
         Args:
+            show_daily (bool, optional): Whether to show daily data. Defaults to False.
             diluted (bool, optional): Whether to use diluted shares in the calculation. Defaults to True.
             rounding (int, optional): The number of decimals to round the results to. Defaults to 4.
             growth (bool, optional): Whether to calculate the growth of the ratios. Defaults to False.
@@ -6519,28 +6737,31 @@ class Ratios:
         ```
         """
         enterprise_value = self.get_enterprise_value(
-            diluted=diluted, trailing=trailing if trailing else None
+            diluted=diluted,
+            trailing=trailing if trailing else None,
+            show_daily=show_daily,
         )
+
+        ebit = (
+            self._income_statement.loc[:, "Net Income", :]
+            + self._income_statement.loc[:, "Income Tax Expense", :]
+            + self._income_statement.loc[:, "Interest Expense", :]
+        )
+
+        if show_daily:
+            ebit = map_period_data_to_daily_data(
+                period_data=ebit,
+                daily_dates=enterprise_value.index,
+                quarterly=self._quarterly,
+            )
 
         if trailing:
             ev_to_ebit = valuation_model.get_ev_to_ebit(
                 enterprise_value,
-                (
-                    self._income_statement.loc[:, "Net Income", :]
-                    + self._income_statement.loc[:, "Income Tax Expense", :]
-                    + self._income_statement.loc[:, "Interest Expense", :]
-                )
-                .T.rolling(trailing)
-                .sum()
-                .T,
+                ebit.T.rolling(trailing).sum().T,
             )
         else:
-            ev_to_ebit = valuation_model.get_ev_to_ebit(
-                enterprise_value,
-                self._income_statement.loc[:, "Net Income", :]
-                + self._income_statement.loc[:, "Income Tax Expense", :]
-                + self._income_statement.loc[:, "Interest Expense", :],
-            )
+            ev_to_ebit = valuation_model.get_ev_to_ebit(enterprise_value, ebit)
 
         if growth:
             return calculate_growth(

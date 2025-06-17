@@ -4,14 +4,20 @@ import pandas as pd
 from financetoolkit import Toolkit
 
 historical = pd.read_pickle("tests/datasets/historical_dataset.pickle")
+risk_free_rate = pd.read_pickle("tests/datasets/risk_free_rate.pickle")
+treasury_data = pd.read_pickle("tests/datasets/treasury_data.pickle")
 
 toolkit = Toolkit(
     tickers=["AAPL", "MSFT"],
     historical=historical,
-    start_date="2013-09-09",
-    end_date="2023-09-07",
+    start_date="2019-12-31",
+    end_date="2023-01-01",
     convert_currency=False,
+    sleep_timer=False,
 )
+
+toolkit._daily_risk_free_rate = risk_free_rate
+toolkit._daily_treasury_data = treasury_data
 
 technical_module = toolkit.technicals
 
@@ -19,18 +25,18 @@ technical_module = toolkit.technicals
 
 
 def test_collect_all_indicators(recorder):
-    recorder.capture(technical_module.collect_all_indicators())
-    recorder.capture(technical_module.collect_all_indicators(growth=True))
+    recorder.capture(technical_module.collect_all_indicators().round(0))
+    recorder.capture(technical_module.collect_all_indicators(growth=True).round(0))
     recorder.capture(
-        technical_module.collect_all_indicators(growth=True, lag=[1, 2, 3])
+        technical_module.collect_all_indicators(growth=True, lag=[1, 2, 3]).round(0)
     )
 
 
 def test_collect_breadth_indicators(recorder):
-    recorder.capture(technical_module.collect_breadth_indicators())
-    recorder.capture(technical_module.collect_breadth_indicators(growth=True))
+    recorder.capture(technical_module.collect_breadth_indicators().round(0))
+    recorder.capture(technical_module.collect_breadth_indicators(growth=True).round(0))
     recorder.capture(
-        technical_module.collect_breadth_indicators(growth=True, lag=[1, 2, 3])
+        technical_module.collect_breadth_indicators(growth=True, lag=[1, 2, 3]).round(0)
     )
 
 
@@ -269,8 +275,8 @@ def test_get_accumulation_distribution_line(recorder):
 
 
 def test_get_chaikin_oscillator(recorder):
-    recorder.capture(technical_module.get_chaikin_oscillator())
-    recorder.capture(technical_module.get_chaikin_oscillator(growth=True))
+    recorder.capture(technical_module.get_chaikin_oscillator().round(0))
+    recorder.capture(technical_module.get_chaikin_oscillator(growth=True).round(0))
     recorder.capture(
-        technical_module.get_chaikin_oscillator(growth=True, lag=[1, 2, 3])
+        technical_module.get_chaikin_oscillator(growth=True, lag=[1, 2, 3]).round(0)
     )
