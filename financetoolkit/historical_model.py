@@ -13,6 +13,13 @@ from tqdm import tqdm
 from financetoolkit import fmp_model, yfinance_model
 from financetoolkit.utilities import error_model, logger_model
 
+# Optional iBind (IBKR) provider; only used if present and selected
+try:
+    from financetoolkit import ibind_model  # noqa: F401
+    ENABLE_IBIND = True
+except Exception:  # pragma: no cover
+    ENABLE_IBIND = False
+
 logger = logger_model.get_logger()
 
 # Check if yfinance is installed
@@ -167,8 +174,32 @@ def get_historical_data(
 
                 attempted_fmp = True
 
+            # Try IBKR via iBind when selected or in fallback chain
             if (
-                enforce_source != "FinancialModelingPrep"
+                enforce_source in ["IBKR"]
+                and historical_data.empty
+                and ENABLE_IBIND
+            ):
+                try:
+                    historical_data = ibind_model.get_historical_data(
+                        ticker=ticker,
+                        start=start,
+                        end=end,
+                        interval=interval,
+                        return_column=return_column,
+                        risk_free_rate=risk_free_rate,
+                        include_dividends=include_dividends,
+                        divide_ohlc_by=divide_ohlc_by,
+                        sleep_timer=sleep_timer,
+                    )
+                except Exception:  # noqa: BLE001
+                    historical_data = pd.DataFrame()
+
+                if not historical_data.empty:
+                    ibkr_tickers.append(ticker)
+
+            if (
+                enforce_source not in ["FinancialModelingPrep", "IBKR"]
                 and historical_data.empty
                 and ENABLE_YFINANCE
             ):
@@ -208,6 +239,7 @@ def get_historical_data(
     historical_data_error_dict: dict[str, pd.DataFrame] = {}
     fmp_tickers: list[str] = []
     yf_tickers: list[str] = []
+    ibkr_tickers: list[str] = []
     no_data: list[str] = []
     threads = []
 
@@ -252,6 +284,12 @@ def get_historical_data(
             "API limits or usage of the Free plan.\n"
             "Therefore data was retrieved from YahooFinance instead for: %s",
             ", ".join(yf_tickers),
+        )
+
+    if ibkr_tickers and show_ticker_seperation:
+        logger.info(
+            "The following tickers acquired historical data from IBKR (iBind): %s",
+            ", ".join(ibkr_tickers),
         )
 
     if no_data and show_errors:
@@ -416,6 +454,7 @@ def convert_daily_to_other_period(
 def get_historical_statistics(
     tickers: list[str] | str,
     api_key: str | None = None,
+    enforce_source: str | None = None,
     progress_bar: bool = True,
     show_errors: bool = False,
     tqdm_message: str = "Obtaining historical statistics",
@@ -456,12 +495,27 @@ def get_historical_statistics(
     def worker(ticker, historical_statistics_dict):
         historical_statistics = pd.DataFrame()
 
+        # Order per enforce_source preference; default is YF then FMP
+        if enforce_source == "FinancialModelingPrep":
+            if api_key:
+                historical_statistics = fmp_model.get_historical_statistics(
+                    ticker=ticker,
+                    api_key=api_key,
+                )
+        elif enforce_source == "IBKR" and ENABLE_IBIND:
+            try:
+                hist_series = ibind_model.get_historical_statistics(ticker)
+                if not hist_series.empty:
+                    historical_statistics = hist_series.to_frame(name=ticker)
+            except Exception:  # noqa: BLE001
+                historical_statistics = pd.DataFrame()
+
         if historical_statistics.empty:
             historical_statistics = yfinance_model.get_historical_statistics(
                 ticker=ticker
             )
 
-        if api_key and historical_statistics.empty:
+        if api_key and historical_statistics.empty and enforce_source in [None, "FinancialModelingPrep"]:
             historical_statistics = fmp_model.get_historical_statistics(
                 ticker=ticker,
                 api_key=api_key,
@@ -470,7 +524,14 @@ def get_historical_statistics(
         if historical_statistics.empty:
             no_data.append(ticker)
         if not historical_statistics.empty:
-            historical_statistics_dict[ticker] = historical_statistics
+            if isinstance(historical_statistics, pd.DataFrame) and historical_statistics.columns.equals(pd.Index([ticker])):
+                historical_statistics_dict[ticker] = historical_statistics[ticker]
+            elif isinstance(historical_statistics, pd.Series):
+                historical_statistics_dict[ticker] = historical_statistics
+            else:
+                # yfinance and fmp return Series; ensure Series
+                historical_statistics_dict[ticker] = historical_statistics.squeeze()
+
 
     if isinstance(tickers, str):
         ticker_list = [tickers]

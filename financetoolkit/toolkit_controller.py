@@ -134,7 +134,7 @@ class Toolkit:
             Used for calculations like Excess Returns. Defaults to "10y".
             benchmark_ticker (str | None): The benchmark ticker (e.g., 'SPY' for S&P 500). Used for comparative analysis
             (CAPM, Alpha, Beta). Defaults to "SPY". Set to None to disable benchmark comparison.
-            enforce_source (str | None): Enforce data source ('FinancialModelingPrep' or 'YahooFinance').
+            enforce_source (str | None): Enforce data source ('FinancialModelingPrep', 'IBKR', or 'YahooFinance').
             Defaults to None (uses FMP if api_key provided, otherwise YahooFinance, with fallback).
             historical (pd.DataFrame): Custom historical price data. See notebook:
             https://www.jeroenbouma.com/projects/financetoolkit/external-datasets. Defaults to an empty DataFrame.
@@ -360,9 +360,9 @@ class Toolkit:
 
         self._enforce_source: str | None = enforce_source
 
-        if self._enforce_source not in [None, "FinancialModelingPrep", "YahooFinance"]:
+        if self._enforce_source not in [None, "FinancialModelingPrep", "IBKR", "YahooFinance"]:
             raise ValueError(
-                "Please select either FinancialModelingPrep or YahooFinance as the "
+                "Please select either FinancialModelingPrep, IBKR, or YahooFinance as the "
                 "enforced source."
             )
         if self._enforce_source == "FinancialModelingPrep" and not self._api_key:
@@ -1998,10 +1998,11 @@ class Toolkit:
         """
         if enforce_source is not None and enforce_source not in [
             "FinancialModelingPrep",
+            "IBKR",
             "YahooFinance",
         ]:
             raise ValueError(
-                "The enforce_source parameter must be either 'FinancialModelingPrep' or 'YahooFinance'."
+                "The enforce_source parameter must be one of 'FinancialModelingPrep', 'IBKR', or 'YahooFinance'."
             )
 
         if self._daily_risk_free_rate.empty or overwrite:
@@ -2704,10 +2705,11 @@ class Toolkit:
 
         if enforce_source is not None and enforce_source not in [
             "FinancialModelingPrep",
+            "IBKR",
             "YahooFinance",
         ]:
             raise ValueError(
-                "The enforce_source parameter must be either 'FinancialModelingPrep' or 'YahooFinance'."
+                "The enforce_source parameter must be one of 'FinancialModelingPrep', 'IBKR', or 'YahooFinance'."
             )
 
         if self._daily_treasury_data.empty or False in specific_rates:
@@ -3198,10 +3200,11 @@ class Toolkit:
 
         if enforce_source is not None and enforce_source not in [
             "FinancialModelingPrep",
+            "IBKR",
             "YahooFinance",
         ]:
             raise ValueError(
-                "The enforce_source parameter must be either 'FinancialModelingPrep' or 'YahooFinance'."
+                "The enforce_source parameter must be one of 'FinancialModelingPrep', 'IBKR', or 'YahooFinance'."
             )
 
         # Correct for the case where a Portfolio ticker exists
@@ -3392,10 +3395,11 @@ class Toolkit:
 
         if enforce_source is not None and enforce_source not in [
             "FinancialModelingPrep",
+            "IBKR",
             "YahooFinance",
         ]:
             raise ValueError(
-                "The enforce_source parameter must be either 'FinancialModelingPrep' or 'YahooFinance'."
+                "The enforce_source parameter must be one of 'FinancialModelingPrep', 'IBKR', or 'YahooFinance'."
             )
 
         # Correct for the case where a Portfolio ticker exists
@@ -3611,10 +3615,11 @@ class Toolkit:
 
         if enforce_source is not None and enforce_source not in [
             "FinancialModelingPrep",
+            "IBKR",
             "YahooFinance",
         ]:
             raise ValueError(
-                "The enforce_source parameter must be either 'FinancialModelingPrep' or 'YahooFinance'."
+                "The enforce_source parameter must be one of 'FinancialModelingPrep', 'IBKR', or 'YahooFinance'."
             )
 
         # Correct for the case where a Portfolio ticker exists
@@ -3766,10 +3771,11 @@ class Toolkit:
 
         if enforce_source is not None and enforce_source not in [
             "FinancialModelingPrep",
+            "IBKR",
             "YahooFinance",
         ]:
             raise ValueError(
-                "The enforce_source parameter must be either 'FinancialModelingPrep' or 'YahooFinance'."
+                "The enforce_source parameter must be one of 'FinancialModelingPrep', 'IBKR', or 'YahooFinance'."
             )
 
         # Correct for the case where a Portfolio ticker exists
