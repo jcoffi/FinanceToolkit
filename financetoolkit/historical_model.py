@@ -13,12 +13,10 @@ from tqdm import tqdm
 from financetoolkit import fmp_model, yfinance_model
 from financetoolkit.utilities import error_model, logger_model
 
-# Optional iBind (IBKR) provider; only used if present and selected
-try:
-    from financetoolkit import ibind_model  # noqa: F401
-    ENABLE_IBIND = True
-except Exception:  # pragma: no cover
-    ENABLE_IBIND = False
+# iBind (IBKR) provider. This module is present in the repo and internally
+# handles absence of the external 'ibind' package or OAuth configuration by
+# returning empty results.
+from financetoolkit import ibind_model  # noqa: F401
 
 logger = logger_model.get_logger()
 
@@ -155,7 +153,37 @@ def get_historical_data(
                 "above affiliate link which also supports the project."
             )
         else:
-            if api_key and enforce_source in [None, "FinancialModelingPrep"]:
+            # Default order: IBKR (iBind) first, then FMP (if allowed), then Yahoo
+            # Enforced provider still takes precedence where applicable.
+            used_ibkr = False
+
+            # Try IBKR first when not explicitly enforcing another provider
+            if enforce_source in [None, "IBKR"] and historical_data.empty:
+                try:
+                    historical_data = ibind_model.get_historical_data(
+                        ticker=ticker,
+                        start=start,
+                        end=end,
+                        interval=interval,
+                        return_column=return_column,
+                        risk_free_rate=risk_free_rate,
+                        include_dividends=include_dividends,
+                        divide_ohlc_by=divide_ohlc_by,
+                        sleep_timer=sleep_timer,
+                    )
+                except Exception:  # noqa: BLE001
+                    historical_data = pd.DataFrame()
+
+                if not historical_data.empty:
+                    ibkr_tickers.append(ticker)
+                    used_ibkr = True
+
+            # Try FMP if allowed and not enforcing YahooFinance
+            if (
+                api_key
+                and historical_data.empty
+                and enforce_source in [None, "FinancialModelingPrep"]
+            ):
                 historical_data = fmp_model.get_historical_data(
                     ticker=ticker,
                     api_key=api_key,
@@ -495,27 +523,25 @@ def get_historical_statistics(
     def worker(ticker, historical_statistics_dict):
         historical_statistics = pd.DataFrame()
 
-        # Order per enforce_source preference; default is YF then FMP
-        if enforce_source == "FinancialModelingPrep":
-            if api_key:
-                historical_statistics = fmp_model.get_historical_statistics(
-                    ticker=ticker,
-                    api_key=api_key,
-                )
-        elif enforce_source == "IBKR" and ENABLE_IBIND:
+        # Default order: IBKR first, then Yahoo, then FMP (if allowed)
+        if enforce_source in [None, "IBKR"]:
             try:
                 hist_series = ibind_model.get_historical_statistics(ticker)
                 if not hist_series.empty:
-                    historical_statistics = hist_series.to_frame(name=ticker)
+                    historical_statistics = hist_series
             except Exception:  # noqa: BLE001
                 historical_statistics = pd.DataFrame()
 
-        if historical_statistics.empty:
+        if historical_statistics.empty and enforce_source in [None, "YahooFinance"]:
             historical_statistics = yfinance_model.get_historical_statistics(
                 ticker=ticker
             )
 
-        if api_key and historical_statistics.empty and enforce_source in [None, "FinancialModelingPrep"]:
+        if (
+            api_key
+            and historical_statistics.empty
+            and enforce_source in [None, "FinancialModelingPrep"]
+        ):
             historical_statistics = fmp_model.get_historical_statistics(
                 ticker=ticker,
                 api_key=api_key,
