@@ -224,17 +224,38 @@ def _enrich_candidates_via_secdef(client, conids: list[str]) -> list[dict]:
         return []
 
 
+def _normalize_symbol_for_ib(sym: str) -> str:
+    s = sym.strip()
+    # Replace common class separators with space (e.g., BRK.B -> BRK B, BRK-B -> BRK B, BRK/B -> BRK B)
+    for ch in (".", "-", "/", ":"):
+        parts = s.split(ch)
+        if len(parts) == 2 and 1 <= len(parts[1]) <= 3:
+            s = " ".join(parts)
+            break
+    return s
+
+
 def _resolve_best_conid(client, ticker: str, start_dt: pd.Timestamp, end_dt: pd.Timestamp) -> str | None:
     # Cache check (US scope cache key)
     key = f"US::{ticker.upper()}"
     ts_now = _now_ts()
     cached = _CONID_CACHE.get(key)
     if cached and (ts_now - cached[1]) < _CONID_TTL_SECONDS:
-        return cached[0]
+        # quick revalidation to avoid stale/permission-denied cached conids
+        conid_cached = cached[0]
+        try:
+            df_check, meta_check = _probe_candidate_history(client, conid_cached, period="1m")
+            if not df_check.empty and not bool(meta_check.get("no_permission")):
+                return conid_cached
+            # invalidate and fall through to resolve
+            _CONID_CACHE.pop(key, None)
+        except Exception:
+            _CONID_CACHE.pop(key, None)
 
     sym = ticker.strip()
     if sym.startswith("^"):
         sym = sym[1:]
+    sym = _normalize_symbol_for_ib(sym)
 
     # Primary path: get concrete conids via stock_conid_by_symbol
     conids: list[str] = []
