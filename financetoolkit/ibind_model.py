@@ -59,6 +59,10 @@ def _mk_period_index(idx: pd.Index, freq: str = "D") -> pd.PeriodIndex:
 _CONID_CACHE: dict[str, tuple[str, float]] = {}
 _CONID_TTL_SECONDS = 7 * 24 * 3600
 
+# Simple backoff tracker for problematic conids (e.g., permission denied)
+_PROBE_BACKOFF: dict[str, float] = {}
+_PROBE_BACKOFF_SECONDS = 15 * 60  # 15 minutes default backoff
+
 
 def _now_ts() -> float:
     try:
@@ -352,9 +356,16 @@ def _resolve_best_conid(client, ticker: str, start_dt: pd.Timestamp, end_dt: pd.
     scored: list[tuple[float, dict, pd.DataFrame, dict]] = []
     for d in candidates[:5]:
         conid = str(d.get('conid'))
+        # respect temporary backoff if previously marked problematic
+        now = _now_ts()
+        bkey = f"{ticker.upper()}::{conid}"
+        cut = _PROBE_BACKOFF.get(bkey)
+        if cut and now < cut:
+            continue
         df_long, meta = _probe_candidate_history(client, conid, period=probe_period_long)
         # skip if no data or if permissions are missing for this conid
         if df_long.empty or (meta.get("no_permission") is True):
+            _PROBE_BACKOFF[bkey] = now + _PROBE_BACKOFF_SECONDS
             # basic pacing/backoff to avoid hammering endpoints on repeated failures
             time.sleep(0.05 + random.random() * 0.1)
             continue

@@ -63,6 +63,11 @@ def test_permission_denied_conids_are_skipped(monkeypatch):
 
 
 def test_cache_quick_revalidation_invalidates_and_picks_valid(monkeypatch):
+    # ensure prior backoff state for this ticker does not interfere
+    for k in list(ib._PROBE_BACKOFF.keys()):
+        if k.startswith("AAPL::"):
+            ib._PROBE_BACKOFF.pop(k, None)
+
     class Dummy:
         pass
     client = Dummy()
