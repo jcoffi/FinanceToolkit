@@ -44,6 +44,7 @@ class Options:
         risk_free_rate: pd.DataFrame = pd.DataFrame(),
         quarterly: bool = False,
         rounding: int | None = 4,
+        enforce_source: str | None = None,
     ):
         """
         Initializes the Options Controller Class. The Options module is meant to calculate important options
@@ -94,6 +95,7 @@ class Options:
         self._daily_historical = daily_historical
         self._quarterly = quarterly
         self._rounding: int | None = rounding
+        self._enforce_source = enforce_source
 
         # Option Statistics
         self._prices = self._daily_historical["Adj Close"]
@@ -179,7 +181,7 @@ class Options:
         |          182.5 | AAPL240112C00182500 | USD        |         3.25 |        0 |                0 |    14721 |               0 |     0 |     0 | 2024-01-12   | 2024-01-11        |                    0 | True           |
         |          185   | AAPL240112C00185000 | USD        |         1.18 |        0 |                0 |   102803 |               0 |     0 |     0 | 2024-01-12   | 2024-01-11        |                    0 | True           |
         """
-        expiry_dates = options_model.get_option_expiry_dates(ticker=self._tickers[0])
+        expiry_dates = options_model.get_option_expiry_dates(ticker=self._tickers[0], enforce_source=getattr(self, "_enforce_source", None))
 
         if show_expiration_dates:
             return expiry_dates
@@ -195,6 +197,7 @@ class Options:
             tickers=self._tickers,
             expiration_date=expiration_date,
             put_option=put_option,
+            enforce_source=getattr(self, "_enforce_source", None),
         )
 
         option_chains["Change"] = option_chains["Change"].round(

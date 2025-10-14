@@ -897,6 +897,7 @@ class Toolkit:
             risk_free_rate=self._daily_risk_free_rate,
             quarterly=self._quarterly,
             rounding=self._rounding,
+            enforce_source=self._enforce_source,
         )
 
     @property
