@@ -72,6 +72,18 @@ Notes:
 - US venues and USD are prioritized for symbol resolution; SMART is used only as a tiebreak.
 - A small on-disk cache is optionally used to avoid repeated downloads; currency conversion is handled by the existing currencies model when needed.
 
+Resolver scoring (US-first, USD-first):
+- Coverage (weight 1.00): observed_bars / expected_bars in the requested window.
+- US primary exchange bonus (weight 0.10): +0.10 if primaryExchange is NYSE or NASDAQ.
+- Exchange rank (weight 0.05): favors NYSE/NASDAQ over ARCA/SMART/others.
+- Currency match (weight 0.05): +0.05 for USD instruments.
+- Recency (weight 0.05): favors fresher last trade dates.
+- secType (weight 0.05): small preference for common stock versus other types when multiple are offered.
+- Delay penalty (weight -0.05): penalizes larger reported mktDataDelay.
+- ADR tiebreaker (+0.03): an additional bonus is applied when all are true: detected ADR instrument, primaryExchange in {NYSE, NASDAQ}, and currency USD. This does not override poor coverage or stale data; it only breaks near-ties among US, USD candidates.
+
+The resolver excludes candidates without market data permissions, applies per-ticker backoff, and maintains a short TTL cache with quick revalidation to avoid reusing stale or unauthorized contracts.
+
 # Basic Usage
 
 This section is an introduction to the Finance Toolkit. Also see [this notebook](https://www.jeroenbouma.com/projects/financetoolkit/getting-started) for a detailed Getting Started guide as well as [this notebook](https://www.jeroenbouma.com/projects/financetoolkit/finance-database) that includes the [Finance Database 🌎](https://www.jeroenbouma.com/projects/financedatabase) and a proper financial analysis. Next to that, find below a fully-fledged code documentation as well as Jupyter Notebooks in which you can see many examples ranging from basic examples to creating custom ratios to working with your own datasets.
