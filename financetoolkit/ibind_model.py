@@ -761,3 +761,303 @@ def get_historical_statistics(ticker: str) -> pd.Series:
     except Exception as e:  # pragma: no cover
         logger.warning("IBKR/iBind stats fetch failed for %s: %s", ticker, e)
         return stats
+
+# -------------------------
+# Options (Expiries, Chains)
+# -------------------------
+
+def _get_ibkr_client():
+    if not _ibind_available() or not _oauth_configured():
+        return None
+    try:  # pragma: no cover - runtime dependency
+        from ibind import IbkrClient  # type: ignore
+        client = IbkrClient()
+        # Best-effort: ensure brokerage session
+        try:
+            client.initialize_brokerage_session()
+        except Exception:
+            pass
+        return client
+    except Exception:
+        return None
+
+
+def _yyyy_mm_dd(date_str: str) -> str:
+    try:
+        return pd.to_datetime(date_str).strftime("%Y-%m-%d")
+    except Exception:
+        return ""
+
+
+def _yyyymmdd(date_str: str) -> str:
+    try:
+        return pd.to_datetime(date_str).strftime("%Y%m%d")
+    except Exception:
+        return ""
+
+
+def _mon_yy(date_str: str) -> str:
+    try:
+        ts = pd.to_datetime(date_str)
+        return ts.strftime("%b%y").upper()
+    except Exception:
+        return ""
+
+
+def get_option_expiry_dates(ticker: str) -> list[str]:
+    """Return available option expiration dates for a ticker via IBKR/iBind.
+
+    Returns list of YYYY-MM-DD. Empty list when unavailable or not configured.
+    """
+    client = _get_ibkr_client()
+    if client is None:
+        return []
+
+    # Resolve underlying conid using recent window
+    end_dt = pd.Timestamp.utcnow().normalize()
+    start_dt = end_dt - pd.Timedelta(days=30)
+    try:
+        conid = _resolve_best_conid(client, ticker, start_dt, end_dt)
+    except Exception:
+        conid = None
+    if not conid:
+        return []
+
+    # Prefer strikes endpoint that often returns expirations list
+    try:
+        res = client.search_strikes_by_conid(conid=str(conid), sec_type="OPT", exchange="SMART")
+        data = getattr(res, "data", None)
+        expirations = []
+        if isinstance(data, dict):
+            # Common CPAPI shape: { "strikes": [...], "expirations": ["YYYYMMDD", ...] }
+            raw = data.get("expirations") or data.get("expirationDates")
+            if isinstance(raw, list):
+                expirations = [_yyyy_mm_dd(str(x)) if len(str(x)) == 8 else _yyyy_mm_dd(x) for x in raw]
+        # Deduplicate and sort ascending
+        expirations = sorted({d for d in expirations if d})
+        if expirations:
+            return expirations
+    except Exception:
+        pass
+
+    # Fallback: try secdef info for a few nearby months and collect maturityDate
+    outs: set[str] = set()
+    try:
+        base = pd.Timestamp.utcnow().normalize().to_period("M").start_time
+        for add in range(0, 8):  # next ~8 months
+            m = (base + pd.DateOffset(months=add)).strftime("%b%y").upper()
+            try:
+                res2 = client.search_secdef_info_by_conid(
+                    conid=str(conid), sec_type="OPT", month=m, exchange="SMART"
+                )
+                data2 = getattr(res2, "data", None)
+                if isinstance(data2, list):
+                    for item in data2:
+                        md = item.get("maturityDate") or item.get("lastTradingDay")
+                        if md:
+                            # md may be YYYYMMDD
+                            ds = _yyyy_mm_dd(str(md)) if len(str(md)) == 8 else _yyyy_mm_dd(str(md))
+                            if ds:
+                                outs.add(ds)
+            except Exception:
+                continue
+    except Exception:
+        pass
+
+    return sorted(outs)
+
+
+def get_option_chains(
+    tickers: list[str],
+    expiration_date: str,
+    put_option: bool = False,
+) -> pd.DataFrame:
+    """Fetch option chains for tickers at a given expiration via IBKR/iBind.
+
+    Returns a DataFrame indexed by (Ticker, Strike Price) with columns matching
+    Toolkit expectations. Empty on error or when not configured.
+    """
+    client = _get_ibkr_client()
+    if client is None:
+        return pd.DataFrame()
+
+    mon_code = _mon_yy(expiration_date)  # e.g., AUG25
+    expiry_yyyymmdd = _yyyymmdd(expiration_date)  # e.g., 20250816
+    right = "P" if put_option else "C"
+
+    fields = [
+        "31",   # last_price
+        "84",   # bid_price
+        "86",   # ask_price
+        "87",   # volume
+        "7638", # option_open_interest
+        "82",   # change
+        "83",   # change_percent
+        "7714", # last_trading_date
+        "7633", # implied_vol_percent
+        "55",   # symbol
+    ]
+
+    result_frames: list[pd.DataFrame] = []
+
+    for ticker in tickers:
+        # Resolve underlying conid
+        end_dt = pd.Timestamp.utcnow().normalize()
+        start_dt = end_dt - pd.Timedelta(days=30)
+        try:
+            under_conid = _resolve_best_conid(client, ticker, start_dt, end_dt)
+        except Exception:
+            under_conid = None
+        if not under_conid:
+            continue
+
+        # Obtain strikes set for expiration
+        strikes: list[float] = []
+        try:
+            res = client.search_strikes_by_conid(
+                conid=str(under_conid), sec_type="OPT", month=mon_code or None, exchange="SMART"
+            )
+            data = getattr(res, "data", None)
+            if isinstance(data, dict):
+                strikes_raw = data.get("strikes") or []
+                if isinstance(strikes_raw, list):
+                    strikes = [float(s) for s in strikes_raw if s is not None]
+        except Exception:
+            # Try without month hint
+            try:
+                res = client.search_strikes_by_conid(conid=str(under_conid), sec_type="OPT", exchange="SMART")
+                data = getattr(res, "data", None)
+                if isinstance(data, dict):
+                    strikes_raw = data.get("strikes") or []
+                    if isinstance(strikes_raw, list):
+                        strikes = [float(s) for s in strikes_raw if s is not None]
+            except Exception:
+                strikes = []
+
+        if not strikes:
+            continue
+
+        # For each strike, resolve option conid for the specified right and month
+        contracts: list[dict] = []
+        for strike in strikes:
+            try:
+                res2 = client.search_secdef_info_by_conid(
+                    conid=str(under_conid),
+                    sec_type="OPT",
+                    month=mon_code or None,
+                    exchange="SMART",
+                    strike=str(strike),
+                    right=right,
+                )
+                data2 = getattr(res2, "data", None)
+                if isinstance(data2, list) and data2:
+                    # Take the first match per strike/right
+                    item = data2[0]
+                    oc = {
+                        "option_conid": str(item.get("conid")),
+                        "strike": float(strike),
+                        "currency": item.get("currency"),
+                        "expiration": expiry_yyyymmdd,
+                    }
+                    contracts.append(oc)
+            except Exception:
+                continue
+
+        # Snapshot market data for all option conids in batches
+        rows: list[dict] = []
+        for i in range(0, len(contracts), 50):
+            batch = contracts[i : i + 50]
+            conids = [c["option_conid"] for c in batch if c.get("option_conid")]
+            if not conids:
+                continue
+            try:
+                md = client.live_marketdata_snapshot(conids=conids, fields=fields)
+                payload = getattr(md, "data", None)
+                if not isinstance(payload, list):
+                    continue
+                # Map each returned conid to its contract
+                by_conid = {c["option_conid"]: c for c in batch}
+                for entry in payload:
+                    # entry fields typically include 'conid'
+                    econid = str(entry.get("conid")) if isinstance(entry, dict) else None
+                    meta = by_conid.get(econid, {})
+                    if not econid:
+                        continue
+                    row = {
+                        "Contract Symbol": str(entry.get("symbol") or econid),
+                        "Strike": meta.get("strike"),
+                        "Currency": meta.get("currency"),
+                        "Last Price": entry.get("last_price"),
+                        "Change": entry.get("change"),
+                        "Percent Change": entry.get("change_percent"),
+                        "Volume": entry.get("volume"),
+                        "Open Interest": entry.get("option_open_interest"),
+                        "Bid": entry.get("bid_price"),
+                        "Ask": entry.get("ask_price"),
+                        "Expiration": _yyyy_mm_dd(meta.get("expiration", "")),
+                        "Last Trade Date": _yyyy_mm_dd(str(entry.get("last_trading_date", ""))),
+                        "Implied Volatility": entry.get("implied_vol_percent"),
+                        # In The Money computed later, requires underlying
+                    }
+                    row["_econid"] = econid
+                    rows.append(row)
+            except Exception:
+                continue
+
+        if not rows:
+            continue
+
+        # Compute In The Money using underlying last price
+        try:
+            und_md = client.live_marketdata_snapshot(conids=[str(under_conid)], fields=["31"])  # last_price
+            und_price = None
+            pdata = getattr(und_md, "data", None)
+            if isinstance(pdata, list) and pdata:
+                und_price = pdata[0].get("last_price")
+        except Exception:
+            und_price = None
+
+        for row in rows:
+            strike_val = row.get("Strike")
+            if und_price is not None and strike_val is not None:
+                row["In The Money"] = bool((und_price > strike_val) if right == "C" else (und_price < strike_val))
+            else:
+                row["In The Money"] = None
+
+        df = pd.DataFrame(rows)
+        if df.empty:
+            continue
+        # Set index to Strike and multiindex with ticker
+        df = df.drop(columns=[c for c in ["_econid"] if c in df.columns])
+        df = df.set_index("Strike", drop=True)
+        df.index.name = "Strike Price"
+        df.insert(0, "Ticker", ticker)
+        df = df.set_index("Ticker", append=True)
+        df = df.reorder_levels(["Ticker", "Strike Price"]).sort_index()
+        result_frames.append(df)
+
+    if not result_frames:
+        return pd.DataFrame()
+
+    final = pd.concat(result_frames, axis=0)
+    # Ensure columns ordering (match yfinance normalization as much as possible)
+    cols = [
+        "Contract Symbol",
+        "Currency",
+        "Last Price",
+        "Change",
+        "Percent Change",
+        "Volume",
+        "Open Interest",
+        "Bid",
+        "Ask",
+        "Expiration",
+        "Last Trade Date",
+        "Implied Volatility",
+        "In The Money",
+    ]
+    # Insert Strike via index; already in index name
+    # Reindex to include all columns (missing will be added as NaN)
+    final = final.reindex(columns=cols)
+    return final
+
