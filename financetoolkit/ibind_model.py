@@ -1,4 +1,3 @@
-from __future__ import annotations
 """IBKR (iBind) Provider Module
 
 Optional provider that uses Voyz/ibind to access IBKR Web API via OAuth 1.0a.
@@ -7,12 +6,17 @@ It has no hard dependency on ibind; if ibind or OAuth config is missing, it
 returns empty DataFrames so the caller can handle fallbacks.
 """
 
+from __future__ import annotations
+
 __docformat__ = "google"
 
+import importlib
 import os
-import time
 import random
+import time
+from contextlib import suppress
 from datetime import datetime
+from time import time as _time
 from typing import Any
 
 import numpy as np
@@ -21,18 +25,54 @@ import pandas as pd
 from financetoolkit import helpers
 from financetoolkit.utilities import logger_model
 
+try:
+    import pandas_market_calendars as pmc  # type: ignore
+except Exception:  # pragma: no cover
+    pmc = None
+
+try:
+    from ibind.client import ibkr_utils as _ibkr_utils  # type: ignore
+except Exception:  # pragma: no cover
+    _ibkr_utils = None
+
 logger = logger_model.get_logger()
 
 # pylint: disable=too-many-arguments
 
+_EPOCH_MS_THRESHOLD = 1_000_000_000_000
+_CLASS_SUFFIX_MIN = 1
+_CLASS_SUFFIX_MAX = 3
+_CLASS_SUFFIX_MED = 2
+_RANK_PRIMARY = 3
+_RANK_EXCH_HIGH = 3
+_RANK_EXCH_MED = 2
+_RANK_EXCH_LOW = 1
+_MIN_REQUIRED_COLUMNS = 5
+_DATE8_LEN = 8
+
+_EPOCH_MS_THRESHOLD = 1_000_000_000_000
+_CLASS_SUFFIX_MIN = 1
+_CLASS_SUFFIX_MAX = 3
+_RANK_PRIMARY = 3
+_RANK_EXCH_HIGH = 3
+_RANK_EXCH_MED = 2
+_RANK_EXCH_LOW = 1
+
+try:
+    import pandas_market_calendars as pmc  # type: ignore
+except Exception:  # pragma: no cover - optional dep
+    pmc = None
+
+try:
+    from ibind.client import ibkr_utils as _ibkr_utils  # type: ignore
+except Exception:  # pragma: no cover - optional dep
+    _ibkr_utils = None
 
 def _ibind_available() -> bool:
     try:
-        import ibind  # noqa: F401
-    except Exception:  # pragma: no cover - optional dep
+        return importlib.util.find_spec("ibind") is not None
+    except Exception:
         return False
-    return True
-
 
 def _oauth_configured() -> bool:
     # Minimal set for OAuth 1.0a in iBind; library may accept more variants.
@@ -44,7 +84,6 @@ def _oauth_configured() -> bool:
     ]
     return all(os.environ.get(k) for k in required_env)
 
-
 def _mk_period_index(idx: pd.Index, freq: str = "D") -> pd.PeriodIndex:
     if not isinstance(idx, pd.DatetimeIndex):
         try:
@@ -54,7 +93,6 @@ def _mk_period_index(idx: pd.Index, freq: str = "D") -> pd.PeriodIndex:
     with pd.option_context("mode.chained_assignment", None):
         return idx.to_period(freq=freq)
 
-
 # Simple TTL cache for conid resolution to reduce probing
 _CONID_CACHE: dict[str, tuple[str, float]] = {}
 _CONID_TTL_SECONDS = 7 * 24 * 3600
@@ -63,14 +101,12 @@ _CONID_TTL_SECONDS = 7 * 24 * 3600
 _PROBE_BACKOFF: dict[str, float] = {}
 _PROBE_BACKOFF_SECONDS = 15 * 60  # 15 minutes default backoff
 
-
 def _now_ts() -> float:
     try:
         return pd.Timestamp.utcnow().timestamp()
     except Exception:
-        import time as _t
-        return _t.time()
-
+        # Fallback for environments where pandas timestamp fails
+        return _time()
 
 def _gather_candidates_from_search(obj: Any) -> list[dict]:
     out: list[dict] = []
@@ -95,9 +131,7 @@ def _gather_candidates_from_search(obj: Any) -> list[dict]:
             uniq.append(d)
     return uniq
 
-
 _US_PRIMARY_EXCHANGES = ["NYSE", "NASDAQ", "ARCA", "BATS", "CBOE", "AMEX"]
-
 
 def _exchange_rank(candidate: dict) -> tuple[int, int]:
     # primaryExchange first, then exchange. SMART is a router, lowest rank.
@@ -112,38 +146,33 @@ def _exchange_rank(candidate: dict) -> tuple[int, int]:
         return 2 if n else 0
     return (rank(str(prim)), rank(str(exch)))
 
-
 def _expected_trading_days(start_dt: pd.Timestamp, end_dt: pd.Timestamp) -> int:
     # Try exchange calendar for XNYS; fallback to pandas bdate_range
     try:
-        import pandas_market_calendars as pmc  # type: ignore
+        if pmc is None:
+            raise RuntimeError("pmc not available")
         cal = pmc.get_calendar("XNYS")
         sched = cal.schedule(start_date=start_dt.date(), end_date=end_dt.date())
         return int(len(sched))
     except Exception:
         return int(len(pd.bdate_range(start_dt, end_dt)))
 
-
 def _compute_coverage(bars: pd.DataFrame, start_dt: pd.Timestamp, end_dt: pd.Timestamp) -> float:
     if bars.empty:
         return 0.0
     # bars indexed by PeriodIndex('D') or datetime; count unique trading days in window
     idx = bars.index
-    if isinstance(idx, pd.PeriodIndex):
-        dt_index = idx.to_timestamp()
-    else:
-        dt_index = pd.DatetimeIndex(idx)
+    dt_index = idx.to_timestamp() if isinstance(idx, pd.PeriodIndex) else pd.DatetimeIndex(idx)
     # Normalize all to UTC naive for safe comparison
-    if getattr(dt_index, 'tz', None) is not None:
-        dt_index = dt_index.tz_convert('UTC').tz_localize(None)
-    sd = start_dt.tz_convert('UTC').tz_localize(None) if getattr(start_dt, 'tz', None) is not None else start_dt
-    ed = end_dt.tz_convert('UTC').tz_localize(None) if getattr(end_dt, 'tz', None) is not None else end_dt
+    if getattr(dt_index, "tz", None) is not None:
+        dt_index = dt_index.tz_convert("UTC").tz_localize(None)
+    sd = start_dt.tz_convert("UTC").tz_localize(None) if getattr(start_dt, "tz", None) is not None else start_dt
+    ed = end_dt.tz_convert("UTC").tz_localize(None) if getattr(end_dt, "tz", None) is not None else end_dt
     mask = (dt_index >= sd) & (dt_index <= ed)
     dt_index = dt_index[mask]
     covered = dt_index.normalize().unique().size
     expected = max(_expected_trading_days(sd, ed), 1)
     return min(1.0, covered / expected)
-
 
 def _history_payload_to_df(payload: Any, freq: str = "D") -> pd.DataFrame:
     if not payload:
@@ -160,16 +189,16 @@ def _history_payload_to_df(payload: Any, freq: str = "D") -> pd.DataFrame:
     rename_map = {"o": "Open", "h": "High", "l": "Low", "c": "Close", "v": "Volume", "adj": "Adj Close", "t": "Date"}
     df = df.rename(columns=rename_map)
     # Timestamp handling
-    idx_col = "Date" if "Date" in df.columns else ("time" if "time" in df.columns else ("ts" if "ts" in df.columns else None))
+    idx_col = "Date" if "Date" in df.columns else (
+        "time" if "time" in df.columns else ("ts" if "ts" in df.columns else None)
+    )
     if not idx_col:
         return pd.DataFrame()
     ser = df[idx_col]
     if np.issubdtype(ser.dtype, np.number):
         unit = "ms"
-        try:
-            unit = "ms" if float(pd.Series(ser).median()) > 1e12 else "s"
-        except Exception:
-            pass
+        with suppress(Exception):
+            unit = "ms" if float(pd.Series(ser).median()) > _EPOCH_MS_THRESHOLD else "s"
         df[idx_col] = pd.to_datetime(ser, unit=unit, utc=False, errors="coerce")
     else:
         df[idx_col] = pd.to_datetime(ser, utc=False, errors="coerce")
@@ -180,7 +209,6 @@ def _history_payload_to_df(payload: Any, freq: str = "D") -> pd.DataFrame:
         df["Adj Close"] = df["Close"]
     return df
 
-
 def _probe_candidate_history(client, conid: str, period: str = "1y") -> tuple[pd.DataFrame, dict]:
     try:
         res = client.marketdata_history_by_conid(conid=str(conid), bar="1d", period=period)
@@ -188,7 +216,17 @@ def _probe_candidate_history(client, conid: str, period: str = "1y") -> tuple[pd
         meta = {}
         if isinstance(payload, dict):
             # capture some metadata if present
-            for k in ("mktDataDelay", "primaryExchange", "exchange", "listingExchange", "symbol", "text", "error", "message"):
+            keys = (
+                "mktDataDelay",
+                "primaryExchange",
+                "exchange",
+                "listingExchange",
+                "symbol",
+                "text",
+                "error",
+                "message",
+            )
+            for k in keys:
                 if k in payload:
                     meta[k] = payload[k]
             # detect permission errors in known fields
@@ -200,49 +238,45 @@ def _probe_candidate_history(client, conid: str, period: str = "1y") -> tuple[pd
     except Exception:
         return pd.DataFrame(), {}
 
-
 def _enrich_candidates_via_secdef(client, conids: list[str]) -> list[dict]:
     if not conids:
         return []
     try:
         res = client.security_definition_by_conid(conids)
-        data = getattr(res, 'data', None)
+        data = getattr(res, "data", None)
         out: list[dict] = []
-        if isinstance(data, dict) and isinstance(data.get('secdef'), list):
-            for item in data['secdef']:
-                if isinstance(item, dict) and item.get('conid'):
+        if isinstance(data, dict) and isinstance(data.get("secdef"), list):
+            for item in data["secdef"]:
+                if isinstance(item, dict) and item.get("conid"):
                     d = {
-                        'conid': item.get('conid'),
-                        'currency': item.get('currency'),
-                        'primaryExchange': item.get('primaryExchange') or item.get('primary_exchange'),
-                        'exchange': item.get('exchange') or item.get('listingExchange'),
-                        'listingExchange': item.get('listingExchange'),
-                        'symbol': item.get('symbol') or item.get('localSymbol'),
-                        'localSymbol': item.get('localSymbol'),
-                        'tradingClass': item.get('tradingClass'),
-                        'secType': item.get('secType')
+                        "conid": item.get("conid"),
+                        "currency": item.get("currency"),
+                        "primaryExchange": item.get("primaryExchange") or item.get("primary_exchange"),
+                        "exchange": item.get("exchange") or item.get("listingExchange"),
+                        "listingExchange": item.get("listingExchange"),
+                        "symbol": item.get("symbol") or item.get("localSymbol"),
+                        "localSymbol": item.get("localSymbol"),
+                        "tradingClass": item.get("tradingClass"),
+                        "secType": item.get("secType")
                     }
                     out.append(d)
         return out
     except Exception:
         return []
 
-
 def _normalize_symbol_for_ib(sym: str) -> str:
     s = sym.strip()
     # Replace common class separators with space (e.g., BRK.B -> BRK B, BRK-B -> BRK B, BRK/B -> BRK B)
     for ch in (".", "-", "/", ":"):
         parts = s.split(ch)
-        if len(parts) == 2 and 1 <= len(parts[1]) <= 3:
+        if len(parts) == _CLASS_SUFFIX_MED and _CLASS_SUFFIX_MIN <= len(parts[1]) <= _CLASS_SUFFIX_MAX:
             s = " ".join(parts)
             break
     return s
 
-
 def _is_adr(cand: dict) -> bool:
-    s = (cand.get('localSymbol') or cand.get('tradingClass') or cand.get('symbol') or '')
-    return 'ADR' in str(s).upper()
-
+    s = (cand.get("localSymbol") or cand.get("tradingClass") or cand.get("symbol") or "")
+    return "ADR" in str(s).upper()
 
 def _resolve_best_conid(client, ticker: str, start_dt: pd.Timestamp, end_dt: pd.Timestamp) -> str | None:
     # Cache check (US scope cache key)
@@ -270,34 +304,34 @@ def _resolve_best_conid(client, ticker: str, start_dt: pd.Timestamp, end_dt: pd.
     # Primary path: get concrete conids via stock_conid_by_symbol
     conids: list[str] = []
     try:
-        from ibind.client import ibkr_utils as _utils
-        q = _utils.StockQuery(symbol=sym)
-        res = client.stock_conid_by_symbol([q], default_filtering=True)
-        data = getattr(res, 'data', None)
-        if isinstance(data, dict):
-            for k, v in data.items():
-                if isinstance(v, (int, str)):
-                    conids.append(str(v))
-        elif isinstance(data, list):
-            conids = [str(x) for x in data]
-    except Exception:
-        pass
+        if _ibkr_utils is not None:
+            q = _ibkr_utils.StockQuery(symbol=sym)
+            res = client.stock_conid_by_symbol([q], default_filtering=True)
+            data = getattr(res, "data", None)
+            if isinstance(data, dict):
+                for k, v in data.items():
+                    if isinstance(v, (int, str)):
+                        conids.append(str(v))
+            elif isinstance(data, list):
+                conids = [str(x) for x in data]
+    except Exception:  # noqa: S110
+            pass
 
     # Fall back to generic contract search to scrape any conids we can find
     if not conids:
         try:
             res = client.search_contract_by_symbol(symbol=sym)
-            cand = _gather_candidates_from_search(getattr(res, 'data', None))
-            conids = [str(d.get('conid')) for d in cand if d.get('conid')]
-        except Exception:
+            cand = _gather_candidates_from_search(getattr(res, "data", None))
+            conids = [str(d.get("conid")) for d in cand if d.get("conid")]
+        except Exception:  # noqa: S110
             pass
         if not conids:
-            for sec_type in ('STK','IND'):
+            for sec_type in ("STK", "IND"):
                 try:
                     res = client.search_contract_by_symbol(symbol=sym, sec_type=sec_type)
-                    cand = _gather_candidates_from_search(getattr(res, 'data', None))
-                    conids += [str(d.get('conid')) for d in cand if d.get('conid')]
-                except Exception:
+                    cand = _gather_candidates_from_search(getattr(res, "data", None))
+                    conids += [str(d.get("conid")) for d in cand if d.get("conid")]
+                except Exception:  # noqa: S110
                     pass
     # Dedup
     conids = [c for i, c in enumerate(conids) if c and c not in conids[:i]]
@@ -308,11 +342,17 @@ def _resolve_best_conid(client, ticker: str, start_dt: pd.Timestamp, end_dt: pd.
     candidates = _enrich_candidates_via_secdef(client, conids[:10])
     if not candidates:
         # As an escape hatch, create minimal candidate dicts from conids
-        candidates = [{'conid': c} for c in conids[:5]]
+        candidates = [{"conid": c} for c in conids[:5]]
 
     # Stage-1 filters: prefer US primaryExchange and USD
     def exch_name(d: dict) -> str:
-        return str(d.get("primaryExchange") or d.get("primary_exchange") or d.get("exchange") or d.get("listingExchange") or "")
+        return str(
+            d.get("primaryExchange")
+            or d.get("primary_exchange")
+            or d.get("exchange")
+            or d.get("listingExchange")
+            or ""
+        )
 
     def currency(d: dict) -> str:
         return str(d.get("currency") or "").upper()
@@ -340,28 +380,25 @@ def _resolve_best_conid(client, ticker: str, start_dt: pd.Timestamp, end_dt: pd.
     probe_period_short = "1m"
 
     def _sectype_weight_for(tkr: str, cand: dict) -> float:
-        st = (cand.get('secType') or '').upper()
+        st = (cand.get("secType") or "").upper()
         if not st:
             # Heuristic: caret implies index intent; else equity default
-            if tkr.startswith('^'):
-                st = 'IND'
-            else:
-                st = 'STK'
-        if st == 'STK':
+            st = "IND" if tkr.startswith("^") else "STK"
+        if st == "STK":
             return 1.0
-        if st == 'ETF':
+        if st == "ETF":
             return 0.95
-        if st == 'IND':
+        if st == "IND":
             return 0.9
-        if st == 'CFD':
+        if st == "CFD":
             return 0.6
-        if st in {'WAR', 'WARRANT', 'OPT', 'OPTION', 'FUT', 'FUTURE'}:
+        if st in {"WAR", "WARRANT", "OPT", "OPTION", "FUT", "FUTURE"}:
             return 0.4
         return 0.8
 
     scored: list[tuple[float, dict, pd.DataFrame, dict]] = []
     for d in candidates[:5]:
-        conid = str(d.get('conid'))
+        conid = str(d.get("conid"))
         # respect temporary backoff if previously marked problematic
         now = _now_ts()
         bkey = f"{ticker.upper()}::{conid}"
@@ -373,27 +410,32 @@ def _resolve_best_conid(client, ticker: str, start_dt: pd.Timestamp, end_dt: pd.
         if df_long.empty or (meta.get("no_permission") is True):
             _PROBE_BACKOFF[bkey] = now + _PROBE_BACKOFF_SECONDS
             # basic pacing/backoff to avoid hammering endpoints on repeated failures
-            time.sleep(0.05 + random.random() * 0.1)
+            time.sleep(0.05 + random.random() * 0.1)  # noqa: S311
             continue
         df_short, _ = _probe_candidate_history(client, conid, period=probe_period_short)
-        time.sleep(0.02 + random.random() * 0.05)
-        last_dt = pd.Timestamp.utcnow().tz_convert('UTC').normalize()
+        time.sleep(0.02 + random.random() * 0.05)  # noqa: S311
+        last_dt = pd.Timestamp.utcnow().tz_convert("UTC").normalize()
         try:
             last_idx = df_long.index.to_timestamp()
-            if getattr(last_idx, 'tz', None) is None:
-                last_idx = last_idx.tz_localize('UTC')
+            if getattr(last_idx, "tz", None) is None:
+                last_idx = last_idx.tz_localize("UTC")
             last_dt = last_idx.max().normalize()
-        except Exception:
+        except Exception:  # noqa: S110
             pass
         # normalize start_dt to UTC naive for comparison
-        sd = start_dt.tz_localize('UTC') if getattr(start_dt, 'tz', None) is None else start_dt.tz_convert('UTC')
+        sd = start_dt.tz_localize("UTC") if getattr(start_dt, "tz", None) is None else start_dt.tz_convert("UTC")
         start_long = max(sd, last_dt - pd.Timedelta(days=365))
         start_short = max(sd, last_dt - pd.Timedelta(days=45))
         cov_long = _compute_coverage(df_long, start_long, last_dt)
         cov_short = _compute_coverage(df_short if not df_short.empty else df_long, start_short, last_dt)
         coverage_norm = 0.7 * cov_long + 0.3 * cov_short
         prim_rank, exch_rank = _exchange_rank(d)
-        exch_rank_norm = 1.0 if prim_rank == 3 else (0.7 if exch_rank == 3 else (0.5 if exch_rank == 2 else (0.3 if exch_rank == 1 else 0.0)))
+        exch_map = {
+            _RANK_EXCH_HIGH: 0.7,
+            _RANK_EXCH_MED: 0.5,
+            _RANK_EXCH_LOW: 0.3,
+        }
+        exch_rank_norm = 1.0 if prim_rank == _RANK_PRIMARY else exch_map.get(exch_rank, 0.0)
         currency_match = 1.0 if currency(d) == "USD" else 0.0
         try:
             age_days = max(0, (pd.Timestamp.now().normalize() - last_dt).days)
@@ -407,8 +449,17 @@ def _resolve_best_conid(client, ticker: str, start_dt: pd.Timestamp, end_dt: pd.
             delay = 0
         delay_norm = min(1.0, max(0.0, delay / 15.0))
         stw = _sectype_weight_for(ticker if isinstance(ticker, str) else str(ticker), d)
-        adr_bonus = 0.03 if (_is_adr(d) and prim_rank == 3 and currency(d) == 'USD') else 0.0
-        score = 1.00 * coverage_norm + 0.10 * (1.0 if prim_rank == 3 else 0.0) + 0.05 * exch_rank_norm + 0.05 * currency_match + 0.05 * recency_norm + 0.05 * stw + adr_bonus - 0.05 * delay_norm
+        adr_bonus = 0.03 if (_is_adr(d) and prim_rank == _RANK_PRIMARY and currency(d) == "USD") else 0.0
+        score = (
+            1.00 * coverage_norm
+            + 0.10 * (1.0 if prim_rank == _RANK_PRIMARY else 0.0)
+            + 0.05 * exch_rank_norm
+            + 0.05 * currency_match
+            + 0.05 * recency_norm
+            + 0.05 * stw
+            + adr_bonus
+            - 0.05 * delay_norm
+        )
         scored.append((score, d, df_long, meta))
 
     if not scored:
@@ -418,95 +469,6 @@ def _resolve_best_conid(client, ticker: str, start_dt: pd.Timestamp, end_dt: pd.
     best_conid = str(scored[0][1].get("conid"))
     _CONID_CACHE[key] = (best_conid, ts_now)
     return best_conid
-
-    # Stage-1 filters: try US primary exchange and USD currency
-    def exch_name(d: dict) -> str:
-        return str(d.get("primaryExchange") or d.get("primary_exchange") or d.get("exchange") or d.get("listingExchange") or "")
-
-    def currency(d: dict) -> str:
-        return str(d.get("currency") or "").upper()
-
-    def apply_filters(candidates: list[dict], require_us_exch: bool, require_usd: bool) -> list[dict]:
-        out: list[dict] = []
-        for d in candidates:
-            ex = exch_name(d).upper()
-            cur = currency(d)
-            if require_us_exch and ex not in _US_PRIMARY_EXCHANGES:
-                continue
-            if require_usd and cur != "USD":
-                continue
-            out.append(d)
-        return out
-
-    candidates = cand
-    for require_us_exch, require_usd in [(True, True), (False, True), (True, False), (False, False)]:
-        filtered = apply_filters(candidates, require_us_exch, require_usd)
-        if filtered:
-            candidates = filtered
-            break
-
-    # Probe up to 5 candidates; compute coverage scores over 1y and ~30 trading days
-    probe_period_long = "1y"
-    probe_period_short = "1m"
-
-    scored: list[tuple[float, dict, pd.DataFrame, dict]] = []
-    count = 0
-    for d in candidates:
-        if count >= 5:
-            break
-        conid = str(d.get("conid"))
-        df_long, meta = _probe_candidate_history(client, conid, period=probe_period_long)
-        if df_long.empty:
-            # skip non-chartable quickly
-            count += 1
-            continue
-        # recent window coverage
-        df_short, _ = _probe_candidate_history(client, conid, period=probe_period_short)
-        # Compute expected bars using calendar between inferred window
-        # Derive approximate end date as last index date
-        last_dt = pd.Timestamp.now().normalize()
-        try:
-            if not df_long.empty:
-                last_dt = df_long.index.to_timestamp().max().normalize()  # type: ignore
-        except Exception:
-            pass
-        start_long = max(start_dt, last_dt - pd.Timedelta(days=365))
-        start_short = max(start_dt, last_dt - pd.Timedelta(days=45))
-        cov_long = _compute_coverage(df_long, start_long, last_dt)
-        cov_short = _compute_coverage(df_short if not df_short.empty else df_long, start_short, last_dt)
-        coverage_norm = 0.7 * cov_long + 0.3 * cov_short
-        # Exchange ranking
-        prim_rank, exch_rank = _exchange_rank(d)
-        exch_rank_norm = 1.0 if prim_rank == 3 else (0.7 if exch_rank == 3 else (0.5 if exch_rank == 2 else (0.3 if exch_rank == 1 else 0.0)))
-        # Currency match
-        currency_match = 1.0 if currency(d) == "USD" else 0.0
-        # Recency
-        try:
-            age_days = max(0, (pd.Timestamp.now().normalize() - last_dt).days)
-            recency_norm = max(0.0, min(1.0, 1.0 - age_days / 30.0))
-        except Exception:
-            recency_norm = 0.0
-        # Delay
-        delay = 0
-        try:
-            delay = int(meta.get("mktDataDelay", 0))
-        except Exception:
-            delay = 0
-        delay_norm = min(1.0, max(0.0, delay / 15.0))  # rough scale
-
-        score = 1.00 * coverage_norm + 0.10 * (1.0 if prim_rank == 3 else 0.0) + 0.05 * exch_rank_norm + 0.05 * currency_match + 0.05 * recency_norm - 0.05 * delay_norm
-        scored.append((score, d, df_long, meta))
-        count += 1
-
-    if not scored:
-        return None
-
-    scored.sort(key=lambda x: (x[0], len(x[2])), reverse=True)
-    best_conid = str(scored[0][1].get("conid"))
-
-    _CONID_CACHE[key] = (best_conid, ts_now)
-    return best_conid
-
 
 def _resolve_conid_for_symbol(client, ticker: str) -> str | None:
     """Resolve a ticker to best IBKR conid using probing and US defaults.
@@ -554,10 +516,7 @@ def get_intraday_data(
 
     # Default window per provider constraints
     try:
-        if end is not None:
-            end_dt = pd.to_datetime(end)
-        else:
-            end_dt = pd.Timestamp.utcnow()
+        end_dt = pd.to_datetime(end) if end is not None else pd.Timestamp.utcnow()
         if start is not None:
             start_dt = pd.to_datetime(start)
             if start_dt > end_dt:
@@ -570,7 +529,7 @@ def get_intraday_data(
         return pd.DataFrame()
 
     try:
-        from ibind import IbkrClient  # type: ignore
+        from ibind import IbkrClient  # type: ignore  # noqa: PLC0415
         client = IbkrClient(use_oauth=True)
         conid = _resolve_conid_for_symbol(client, ticker)
         if not conid:
@@ -593,7 +552,6 @@ def get_intraday_data(
         return df
     except Exception:
         return pd.DataFrame()
-
 
 def get_historical_data(
     ticker: str,
@@ -646,8 +604,9 @@ def get_historical_data(
     period = "1y"
 
     try:
-        from ibind import IbkrClient  # type: ignore
-        from financetoolkit.utilities import cache_model
+        from ibind import IbkrClient  # type: ignore  # noqa: PLC0415
+
+        from financetoolkit.utilities import cache_model  # noqa: E402, PLC0415
 
         client = IbkrClient(use_oauth=True)
         # Resolve conid (supports indices like TNX/VIX and equities)
@@ -725,7 +684,7 @@ def get_historical_data(
         ser = df[idx_col]
         if np.issubdtype(ser.dtype, np.number):
             try:
-                unit = "ms" if float(pd.Series(ser).median()) > 1e12 else "s"
+                unit = "ms" if float(pd.Series(ser).median()) > _EPOCH_MS_THRESHOLD else "s"
             except Exception:
                 unit = "ms"
             df[idx_col] = pd.to_datetime(ser, unit=unit, utc=False, errors="coerce")
@@ -737,7 +696,7 @@ def get_historical_data(
         # Keep required columns
         cols = ["Open", "High", "Low", "Close", "Adj Close", "Volume"]
         present = [c for c in cols if c in df.columns]
-        if len(present) < 5:  # require at least OHLCV; Adj Close may be synthesized
+        if len(present) < _MIN_REQUIRED_COLUMNS:  # require at least OHLCV; Adj Close may be synthesized
             return pd.DataFrame()
         df = df[[c for c in cols if c in df.columns]]
 
@@ -754,7 +713,7 @@ def get_historical_data(
         # Save raw before enrichment if caching is enabled
         try:
             if use_cached_data:
-                from financetoolkit.utilities import cache_model
+                from financetoolkit.utilities import cache_model  # noqa: E402, PLC0415
                 cache_model.save_cached_data(
                     cached_data=df,
                     cached_data_location=cached_data_location if isinstance(use_cached_data, str) else "cached",
@@ -762,7 +721,7 @@ def get_historical_data(
                     method="pandas",
                     include_message=False,
                 )
-        except Exception:
+        except Exception:  # noqa: S110
             pass
 
         df = helpers.enrich_historical_data(
@@ -778,7 +737,6 @@ def get_historical_data(
     except Exception as e:  # pragma: no cover - robust optional integration
         logger.warning("IBKR/iBind historical fetch failed for %s: %s", ticker, e)
         return pd.DataFrame()
-
 
 def get_historical_statistics(ticker: str) -> pd.Series:
     """Return basic instrument statistics schema as Series.
@@ -804,12 +762,12 @@ def get_historical_statistics(ticker: str) -> pd.Series:
         return stats
 
     try:
-        from ibind import IbkrClient  # type: ignore
+        from ibind import IbkrClient  # type: ignore  # noqa: PLC0415
 
         client = IbkrClient(use_oauth=True)
         # Lookup contract by symbol to obtain currency/exchange
         # Normalize caret-prefix if present
-        sym = ticker[1:] if ticker.startswith('^') else ticker
+        sym = ticker[1:] if ticker.startswith("^") else ticker
         # Try stock first, then index
         try:
             res = client.stock_conid_by_symbol(sym)
@@ -820,11 +778,11 @@ def get_historical_statistics(ticker: str) -> pd.Series:
                 stats.loc["Exchange Name"] = data.get("exchange") or data.get("listingExchange")
                 stats.loc["Instrument Type"] = data.get("secType") or "STK"
                 return stats
-        except Exception:
+        except Exception:  # noqa: S110
             pass
         try:
-            res = client.search_contract_by_symbol(symbol=sym, sec_type='IND')
-            data = getattr(res, 'data', None)
+            res = client.search_contract_by_symbol(symbol=sym, sec_type="IND")
+            data = getattr(res, "data", None)
             # Best-effort extraction of basic fields if present
             if isinstance(data, dict):
                 stats.loc["Symbol"] = data.get("symbol") or sym
@@ -843,17 +801,14 @@ def _get_ibkr_client():
     if not _ibind_available() or not _oauth_configured():
         return None
     try:  # pragma: no cover - runtime dependency
-        from ibind import IbkrClient  # type: ignore
+        from ibind import IbkrClient  # type: ignore  # noqa: PLC0415
         client = IbkrClient()
         # Best-effort: ensure brokerage session
-        try:
+        with suppress(Exception):
             client.initialize_brokerage_session()
-        except Exception:
-            pass
         return client
     except Exception:
         return None
-
 
 def _yyyy_mm_dd(date_str: str) -> str:
     try:
@@ -861,13 +816,11 @@ def _yyyy_mm_dd(date_str: str) -> str:
     except Exception:
         return ""
 
-
 def _yyyymmdd(date_str: str) -> str:
     try:
         return pd.to_datetime(date_str).strftime("%Y%m%d")
     except Exception:
         return ""
-
 
 def _mon_yy(date_str: str) -> str:
     try:
@@ -875,7 +828,6 @@ def _mon_yy(date_str: str) -> str:
         return ts.strftime("%b%y").upper()
     except Exception:
         return ""
-
 
 def get_option_expiry_dates(ticker: str) -> list[str]:
     """Return available option expiration dates for a ticker via IBKR/iBind.
@@ -905,13 +857,13 @@ def get_option_expiry_dates(ticker: str) -> list[str]:
             # Common CPAPI shape: { "strikes": [...], "expirations": ["YYYYMMDD", ...] }
             raw = data.get("expirations") or data.get("expirationDates")
             if isinstance(raw, list):
-                expirations = [_yyyy_mm_dd(str(x)) if len(str(x)) == 8 else _yyyy_mm_dd(x) for x in raw]
+                expirations = [_yyyy_mm_dd(str(x)) if len(str(x)) == _DATE8_LEN else _yyyy_mm_dd(x) for x in raw]
         # Deduplicate and sort ascending
         expirations = sorted({d for d in expirations if d})
         if expirations:
             return expirations
-    except Exception:
-        pass
+    except Exception:  # noqa: S110
+            pass
 
     # Fallback: try secdef info for a few nearby months and collect maturityDate
     outs: set[str] = set()
@@ -929,16 +881,15 @@ def get_option_expiry_dates(ticker: str) -> list[str]:
                         md = item.get("maturityDate") or item.get("lastTradingDay")
                         if md:
                             # md may be YYYYMMDD
-                            ds = _yyyy_mm_dd(str(md)) if len(str(md)) == 8 else _yyyy_mm_dd(str(md))
+                            ds = _yyyy_mm_dd(str(md)) if len(str(md)) == _DATE8_LEN else _yyyy_mm_dd(str(md))
                             if ds:
                                 outs.add(ds)
-            except Exception:
+            except Exception:  # noqa: S112
                 continue
-    except Exception:
-        pass
+    except Exception:  # noqa: S110
+            pass
 
     return sorted(outs)
-
 
 def get_option_chains(
     tickers: list[str],
@@ -1033,7 +984,7 @@ def get_option_chains(
                         "expiration": expiry_yyyymmdd,
                     }
                     contracts.append(oc)
-            except Exception:
+            except Exception:  # noqa: S112
                 continue
 
         # Snapshot market data for all option conids in batches
@@ -1074,7 +1025,7 @@ def get_option_chains(
                     }
                     row["_econid"] = econid
                     rows.append(row)
-            except Exception:
+            except Exception:  # noqa: S112
                 continue
 
         if not rows:

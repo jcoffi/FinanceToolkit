@@ -10,13 +10,8 @@ import numpy as np
 import pandas as pd
 from tqdm import tqdm
 
-from financetoolkit import fmp_model, yfinance_model
+from financetoolkit import fmp_model, ibind_model, yfinance_model
 from financetoolkit.utilities import error_model, logger_model
-
-# iBind (IBKR) provider. This module is present in the repo and internally
-# handles absence of the external 'ibind' package or OAuth configuration by
-# returning empty results.
-from financetoolkit import ibind_model
 
 logger = logger_model.get_logger()
 
@@ -591,7 +586,10 @@ def get_historical_statistics(
         if historical_statistics.empty:
             no_data.append(ticker)
         if not historical_statistics.empty:
-            if isinstance(historical_statistics, pd.DataFrame) and historical_statistics.columns.equals(pd.Index([ticker])):
+            if (
+                isinstance(historical_statistics, pd.DataFrame)
+                and historical_statistics.columns.equals(pd.Index([ticker]))
+            ):
                 historical_statistics_dict[ticker] = historical_statistics[ticker]
             elif isinstance(historical_statistics, pd.Series):
                 historical_statistics_dict[ticker] = historical_statistics
@@ -644,3 +642,4 @@ def get_historical_statistics(
         return historical_statistics, no_data
 
     return pd.DataFrame(), no_data
+
