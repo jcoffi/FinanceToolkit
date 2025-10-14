@@ -182,9 +182,13 @@ def _probe_candidate_history(client, conid: str, period: str = "1y") -> tuple[pd
         meta = {}
         if isinstance(payload, dict):
             # capture some metadata if present
-            for k in ("mktDataDelay", "primaryExchange", "exchange", "listingExchange", "symbol", "text"):
+            for k in ("mktDataDelay", "primaryExchange", "exchange", "listingExchange", "symbol", "text", "error", "message"):
                 if k in payload:
                     meta[k] = payload[k]
+            # detect permission errors in known fields
+            msg = str(payload.get("text") or payload.get("error") or payload.get("message") or "").lower()
+            if "permission" in msg:
+                meta["no_permission"] = True
         df = _history_payload_to_df(payload)
         return df, meta
     except Exception:
@@ -326,7 +330,8 @@ def _resolve_best_conid(client, ticker: str, start_dt: pd.Timestamp, end_dt: pd.
     for d in candidates[:5]:
         conid = str(d.get('conid'))
         df_long, meta = _probe_candidate_history(client, conid, period=probe_period_long)
-        if df_long.empty:
+        # skip if no data or if permissions are missing for this conid
+        if df_long.empty or (meta.get("no_permission") is True):
             continue
         df_short, _ = _probe_candidate_history(client, conid, period=probe_period_short)
         last_dt = pd.Timestamp.utcnow().tz_convert('UTC').normalize()
