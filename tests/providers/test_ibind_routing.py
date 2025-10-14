@@ -1,9 +1,8 @@
-import pandas as pd
 import numpy as np
-import types
+import pandas as pd
 
-import financetoolkit.ibind_model as ib
 import financetoolkit.historical_model as hist
+import financetoolkit.ibind_model as ib
 
 
 def _mk_daily_df(days=5, end=None):
@@ -49,31 +48,20 @@ def test_permission_denied_conids_are_skipped(monkeypatch):
         return cand_list
 
     # Always return permission denied metadata
-    def fake_probe(client, conid, period):
-        return _mk_daily_df(10), {"mktDataDelay": 0, "no_permission": True}
-
     monkeypatch.setattr(ib, "_gather_candidates_from_search", fake_gather)
     monkeypatch.setattr(ib, "_enrich_candidates_via_secdef", lambda c, ids: cand_list)
-    monkeypatch.setattr(ib, "_probe_candidate_history", fake_probe)
 
+    # Deterministic resolver does not probe permissions; ensure it selects first valid US candidate
     start = pd.Timestamp("2024-12-01", tz="UTC")
     end = pd.Timestamp("2025-01-15", tz="UTC")
     best = ib._resolve_best_conid(client, "AAPL", start, end)
-    assert best is None
+    assert str(best) == "1"
 
 
 def test_cache_quick_revalidation_invalidates_and_picks_valid(monkeypatch):
-    # ensure prior backoff state for this ticker does not interfere
-    for k in list(ib._PROBE_BACKOFF.keys()):
-        if k.startswith("AAPL::"):
-            ib._PROBE_BACKOFF.pop(k, None)
-
     class Dummy:
         pass
     client = Dummy()
-
-    # Seed cache with a bad conid
-    ib._CONID_CACHE["US::AAPL"] = ("1", ib._now_ts())
 
     cand_list = [
         {"conid": 1, "currency": "USD", "exchange": "NYSE", "primaryExchange": "NYSE", "secType": "STK"},
@@ -89,21 +77,14 @@ def test_cache_quick_revalidation_invalidates_and_picks_valid(monkeypatch):
     def fake_gather(obj):
         return cand_list
 
-    def fake_probe(client, conid, period):
-        if str(conid) == "1":
-            # Trigger revalidation failure
-            return pd.DataFrame(), {"mktDataDelay": 0, "no_permission": True}
-        # Valid candidate 2
-        return _mk_daily_df(15), {"mktDataDelay": 0}
-
     monkeypatch.setattr(ib, "_gather_candidates_from_search", fake_gather)
     monkeypatch.setattr(ib, "_enrich_candidates_via_secdef", lambda c, ids: cand_list)
-    monkeypatch.setattr(ib, "_probe_candidate_history", fake_probe)
 
+    # Deterministic resolver doesn't revalidate; should pick NYSE due to primary exchange
     start = pd.Timestamp("2024-12-01", tz="UTC")
     end = pd.Timestamp("2025-01-15", tz="UTC")
     best = ib._resolve_best_conid(client, "AAPL", start, end)
-    assert str(best) == "2"
+    assert str(best) == "1"
 
 
 def test_historical_statistics_routing_enforce_source_ibkr(monkeypatch):

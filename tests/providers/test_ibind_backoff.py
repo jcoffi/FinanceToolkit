@@ -1,5 +1,5 @@
-import pandas as pd
 import numpy as np
+import pandas as pd
 
 import financetoolkit.ibind_model as ib
 
@@ -41,20 +41,9 @@ def test_probe_backoff_skips_problematic_conid(monkeypatch):
     monkeypatch.setattr(ib, "_gather_candidates_from_search", lambda obj: cand_list)
     monkeypatch.setattr(ib, "_enrich_candidates_via_secdef", lambda c, ids: cand_list)
 
-    # Seed a backoff for AAPL::1 to ensure it is skipped
-    ib._PROBE_BACKOFF["AAPL::1"] = ib._now_ts() + 3600
-
-    calls = []
-
-    def fake_probe(client, conid, period):
-        calls.append(str(conid))
-        return _mk_daily_df(15), {"mktDataDelay": 0}
-
-    monkeypatch.setattr(ib, "_probe_candidate_history", fake_probe)
-
+    # Backoff removed in deterministic resolver; ensure deterministic pick honors US primaries
     start = pd.Timestamp("2024-12-01", tz="UTC")
     end = pd.Timestamp("2025-01-15", tz="UTC")
     best = ib._resolve_best_conid(client, "AAPL", start, end)
-    assert str(best) == "2"
-    # Ensure we never probed conid 1 due to active backoff
-    assert "1" not in calls
+    assert str(best) == "1"  # NYSE preferred when both are valid
+

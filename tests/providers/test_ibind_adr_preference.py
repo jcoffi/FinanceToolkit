@@ -1,5 +1,5 @@
-import pandas as pd
 import numpy as np
+import pandas as pd
 
 import financetoolkit.ibind_model as ib
 
@@ -28,8 +28,21 @@ def test_adr_bonus_prefers_usd_primary_exchange(monkeypatch):
 
     # Two candidates: both have identical coverage; ADR on NYSE USD should win via bonus
     cand_list = [
-        {"conid": 1, "currency": "USD", "exchange": "NYSE", "primaryExchange": "NYSE", "secType": "STK", "localSymbol": "XYZ ADR"},
-        {"conid": 2, "currency": "USD", "exchange": "NASDAQ", "primaryExchange": "NASDAQ", "secType": "STK"},
+        {
+            "conid": 1,
+            "currency": "USD",
+            "exchange": "NYSE",
+            "primaryExchange": "NYSE",
+            "secType": "STK",
+            "localSymbol": "XYZ ADR",
+        },
+        {
+            "conid": 2,
+            "currency": "USD",
+            "exchange": "NASDAQ",
+            "primaryExchange": "NASDAQ",
+            "secType": "STK",
+        },
     ]
 
     class DummyRes:

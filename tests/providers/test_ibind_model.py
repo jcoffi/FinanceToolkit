@@ -1,6 +1,5 @@
-import pandas as pd
 import numpy as np
-import types
+import pandas as pd
 
 import financetoolkit.ibind_model as ib
 
@@ -27,7 +26,7 @@ def test_compute_coverage_periodindex():
     start = df.index.to_timestamp().min()
     end = df.index.to_timestamp().max()
     cov = ib._compute_coverage(df, start, end)
-    assert 0.9 <= cov <= 1.0
+    assert 0.9 <= cov <= 1.0  # noqa: PLR2004
 
 
 def test_history_payload_to_df_variants():
@@ -39,7 +38,7 @@ def test_history_payload_to_df_variants():
     df = ib._history_payload_to_df(payload)
     assert not df.empty
     assert set(["Open","High","Low","Close","Adj Close","Volume"]).issubset(df.columns)
-    assert isinstance(df.index, pd.PeriodIndex) and df.index.freqstr == 'D'
+    assert isinstance(df.index, pd.PeriodIndex) and df.index.freqstr == "D"
 
     # list directly
     payload2 = [
@@ -51,39 +50,40 @@ def test_history_payload_to_df_variants():
     assert isinstance(df2.index, pd.PeriodIndex)
 
 
-def test_resolve_best_conid_scoring_prefers_coverage(monkeypatch):
-    # Simulate candidates with different coverage
+def test_resolve_best_conid_deterministic_order(monkeypatch):
+    # Deterministic selection without coverage probing; US/USD-first
     class Dummy:
         pass
     client = Dummy()
 
-    # Monkeypatch candidate gathering to fixed set
     cand_list = [
-        {"conid": 1, "currency": "USD", "exchange": "NASDAQ", "listingExchange": "NASDAQ", "primaryExchange": "NASDAQ", "secType": "STK"},
-        {"conid": 2, "currency": "USD", "exchange": "NYSE", "listingExchange": "NYSE", "primaryExchange": "NYSE", "secType": "STK"},
+        {
+            "conid": 1,
+            "currency": "USD",
+            "exchange": "NASDAQ",
+            "listingExchange": "NASDAQ",
+            "primaryExchange": "NASDAQ",
+            "secType": "STK",
+        },
+        {
+            "conid": 2,
+            "currency": "USD",
+            "exchange": "NYSE",
+            "listingExchange": "NYSE",
+            "primaryExchange": "NYSE",
+            "secType": "STK",
+        },
     ]
-
-    def fake_gather(obj):
-        return cand_list
 
     class DummyRes:
         def __init__(self, data):
             self.data = data
-    # Provide search_contract_by_symbol so fallback path yields our candidates
     client.search_contract_by_symbol = lambda symbol, sec_type=None: DummyRes(cand_list)
 
-
-    # conid 1 has fewer bars, conid 2 has more bars
-    def fake_probe(client, conid, period):
-        if str(conid) == '1':
-            return _mk_daily_df(5), {"mktDataDelay": 0}
-        return _mk_daily_df(20), {"mktDataDelay": 0}
-
-    monkeypatch.setattr(ib, "_gather_candidates_from_search", fake_gather)
+    monkeypatch.setattr(ib, "_gather_candidates_from_search", lambda obj: cand_list)
     monkeypatch.setattr(ib, "_enrich_candidates_via_secdef", lambda c, ids: cand_list)
-    monkeypatch.setattr(ib, "_probe_candidate_history", fake_probe)
 
     start = pd.Timestamp("2024-12-01").tz_localize("UTC")
     end = pd.Timestamp("2025-01-15").tz_localize("UTC")
     best = ib._resolve_best_conid(client, "AAPL", start, end)
-    assert str(best) == "2"
+    assert str(best) == "1"

@@ -12,11 +12,8 @@ __docformat__ = "google"
 
 import importlib
 import os
-import random
-import time
 from contextlib import suppress
 from datetime import datetime
-from time import time as _time
 from typing import Any
 
 import numpy as np
@@ -38,15 +35,15 @@ except Exception:  # pragma: no cover
 logger = logger_model.get_logger()
 
 # pylint: disable=too-many-arguments
+def check_dependencies() -> tuple[object | None, object | None]:
+    """Return optional dependencies as detected at import time: (pmc, _ibkr_utils)."""
+    return pmc, _ibkr_utils
+
 
 _EPOCH_MS_THRESHOLD = 1_000_000_000_000
 _CLASS_SUFFIX_MIN = 1
 _CLASS_SUFFIX_MAX = 3
 _CLASS_SUFFIX_MED = 2
-_RANK_PRIMARY = 3
-_RANK_EXCH_HIGH = 3
-_RANK_EXCH_MED = 2
-_RANK_EXCH_LOW = 1
 _MIN_REQUIRED_COLUMNS = 5
 _DATE8_LEN = 8
 
@@ -76,21 +73,6 @@ def _mk_period_index(idx: pd.Index, freq: str = "D") -> pd.PeriodIndex:
             idx = pd.to_datetime([])
     with pd.option_context("mode.chained_assignment", None):
         return idx.to_period(freq=freq)
-
-# Simple TTL cache for conid resolution to reduce probing
-_CONID_CACHE: dict[str, tuple[str, float]] = {}
-_CONID_TTL_SECONDS = 7 * 24 * 3600
-
-# Simple backoff tracker for problematic conids (e.g., permission denied)
-_PROBE_BACKOFF: dict[str, float] = {}
-_PROBE_BACKOFF_SECONDS = 15 * 60  # 15 minutes default backoff
-
-def _now_ts() -> float:
-    try:
-        return pd.Timestamp.utcnow().timestamp()
-    except Exception:
-        # Fallback for environments where pandas timestamp fails
-        return _time()
 
 def _gather_candidates_from_search(obj: Any) -> list[dict]:
     out: list[dict] = []
@@ -140,6 +122,11 @@ def _expected_trading_days(start_dt: pd.Timestamp, end_dt: pd.Timestamp) -> int:
         return int(len(sched))
     except Exception:
         return int(len(pd.bdate_range(start_dt, end_dt)))
+
+# Scoring constants for exchange rank comparisons
+_RANK_PRIMARY = 3
+_RANK_EXCH_HIGH = 3
+_RANK_EXCH_MED = 2
 
 def _compute_coverage(bars: pd.DataFrame, start_dt: pd.Timestamp, end_dt: pd.Timestamp) -> float:
     if bars.empty:
@@ -262,30 +249,17 @@ def _is_adr(cand: dict) -> bool:
     s = (cand.get("localSymbol") or cand.get("tradingClass") or cand.get("symbol") or "")
     return "ADR" in str(s).upper()
 
-def _resolve_best_conid(client, ticker: str, start_dt: pd.Timestamp, end_dt: pd.Timestamp) -> str | None:
-    # Cache check (US scope cache key)
-    key = f"US::{ticker.upper()}"
-    ts_now = _now_ts()
-    cached = _CONID_CACHE.get(key)
-    if cached and (ts_now - cached[1]) < _CONID_TTL_SECONDS:
-        # quick revalidation to avoid stale/permission-denied cached conids
-        conid_cached = cached[0]
-        try:
-            df_check, meta_check = _probe_candidate_history(client, conid_cached, period="1m")
-            if not df_check.empty and not bool(meta_check.get("no_permission")):
-                return conid_cached
-            # invalidate and fall through to resolve
-            _CONID_CACHE.pop(key, None)
-
-        except Exception:
-            _CONID_CACHE.pop(key, None)
-
+def resolve_conid_simple(client, ticker: str) -> list[dict]:
+    """Return a small list of candidate dicts (enriched when possible) for a ticker.
+    - StockQuery path first when ibkr_utils is available
+    - Fallback to search_contract_by_symbol with sec_type in [None, 'STK', 'IND'] once
+    No probing, no internal caching/backoff.
+    """
     sym = ticker.strip()
     if sym.startswith("^"):
         sym = sym[1:]
     sym = _normalize_symbol_for_ib(sym)
 
-    # Primary path: get concrete conids via stock_conid_by_symbol
     conids: list[str] = []
     try:
         if _ibkr_utils is not None:
@@ -293,42 +267,44 @@ def _resolve_best_conid(client, ticker: str, start_dt: pd.Timestamp, end_dt: pd.
             res = client.stock_conid_by_symbol([q], default_filtering=True)
             data = getattr(res, "data", None)
             if isinstance(data, dict):
-                for k, v in data.items():
+                for _, v in data.items():
                     if isinstance(v, (int, str)):
                         conids.append(str(v))
             elif isinstance(data, list):
                 conids = [str(x) for x in data]
-    except Exception:  # noqa: S110
-            pass
+    except Exception:
+        ...
 
-    # Fall back to generic contract search to scrape any conids we can find
     if not conids:
+        # attempt generic search first, then typed fallbacks
         try:
             res = client.search_contract_by_symbol(symbol=sym)
             cand = _gather_candidates_from_search(getattr(res, "data", None))
             conids = [str(d.get("conid")) for d in cand if d.get("conid")]
-        except Exception:  # noqa: S110
-            pass
-        if not conids:
-            for sec_type in ("STK", "IND"):
-                try:
-                    res = client.search_contract_by_symbol(symbol=sym, sec_type=sec_type)
-                    cand = _gather_candidates_from_search(getattr(res, "data", None))
-                    conids += [str(d.get("conid")) for d in cand if d.get("conid")]
-                except Exception:  # noqa: S110
-                    pass
-    # Dedup
+        except Exception:
+            ...
+        for sec_type in ("STK", "IND"):
+            if conids:
+                break
+            try:
+                res2 = client.search_contract_by_symbol(symbol=sym, sec_type=sec_type)
+                cand2 = _gather_candidates_from_search(getattr(res2, "data", None))
+                conids = [str(d.get("conid")) for d in cand2 if d.get("conid")]
+            except Exception:
+                ...
+
+    # Dedup small set
     conids = [c for i, c in enumerate(conids) if c and c not in conids[:i]]
     if not conids:
-        return None
+        return []
 
-    # Enrich with secdef to get primaryExchange/currency/tradingClass
-    candidates = _enrich_candidates_via_secdef(client, conids[:10])
-    if not candidates:
-        # As an escape hatch, create minimal candidate dicts from conids
-        candidates = [{"conid": c} for c in conids[:5]]
+    # Enrich minimal fields needed for scoring
+    cands = _enrich_candidates_via_secdef(client, conids[:10]) or [{"conid": c} for c in conids[:5]]
+    return cands
 
-    # Stage-1 filters: prefer US primaryExchange and USD
+
+def score_candidates(candidates: list[dict]) -> list[tuple[float, dict]]:
+    """Pure scoring: US-first, USD-first, primaryExchange over SMART, small ADR bonus."""
     def exch_name(d: dict) -> str:
         return str(
             d.get("primaryExchange")
@@ -341,118 +317,36 @@ def _resolve_best_conid(client, ticker: str, start_dt: pd.Timestamp, end_dt: pd.
     def currency(d: dict) -> str:
         return str(d.get("currency") or "").upper()
 
-    def apply_filters(cands: list[dict], require_us_exch: bool, require_usd: bool) -> list[dict]:
-        out: list[dict] = []
-        for d in cands:
-            ex = exch_name(d).upper()
-            cur = currency(d)
-            if require_us_exch and ex not in _US_PRIMARY_EXCHANGES:
-                continue
-            if require_usd and cur != "USD":
-                continue
-            out.append(d)
-        return out
+    out: list[tuple[float, dict]] = []
+    for d in candidates:
+        prim, exch = _exchange_rank(d)
+        score = 0.0
+        # Prefer primary US exchanges
+        score += 1.0 if prim == _RANK_PRIMARY else 0.0
+        # Prefer known US exchanges and penalize SMART router as sole exchange
+        score += 0.3 if exch == _RANK_EXCH_HIGH else (0.1 if exch == _RANK_EXCH_MED else 0.0)
+        # Prefer USD
+        score += 0.3 if currency(d) == "USD" else 0.0
+        # ADR slight bonus as final tie-breaker when already US/USD
+        is_adr = _is_adr(d)
+        score += 0.05 if is_adr and prim == _RANK_PRIMARY and currency(d) == "USD" else 0.0
+        out.append((score, d))
+    # Highest first
+    out.sort(key=lambda x: x[0], reverse=True)
+    return out
 
-    for require_us_exch, require_usd in [(True, True), (False, True), (True, False), (False, False)]:
-        filtered = apply_filters(candidates, require_us_exch, require_usd)
-        if filtered:
-            candidates = filtered
-            break
 
-    # Probe and score
-    probe_period_long = "1y"
-    probe_period_short = "1m"
-
-    def _sectype_weight_for(tkr: str, cand: dict) -> float:
-        st = (cand.get("secType") or "").upper()
-        if not st:
-            # Heuristic: caret implies index intent; else equity default
-            st = "IND" if tkr.startswith("^") else "STK"
-        if st == "STK":
-            return 1.0
-        if st == "ETF":
-            return 0.95
-        if st == "IND":
-            return 0.9
-        if st == "CFD":
-            return 0.6
-        if st in {"WAR", "WARRANT", "OPT", "OPTION", "FUT", "FUTURE"}:
-            return 0.4
-        return 0.8
-
-    scored: list[tuple[float, dict, pd.DataFrame, dict]] = []
-    for d in candidates[:5]:
-        conid = str(d.get("conid"))
-        # respect temporary backoff if previously marked problematic
-        now = _now_ts()
-        bkey = f"{ticker.upper()}::{conid}"
-        cut = _PROBE_BACKOFF.get(bkey)
-        if cut and now < cut:
-            continue
-        df_long, meta = _probe_candidate_history(client, conid, period=probe_period_long)
-        # skip if no data or if permissions are missing for this conid
-        if df_long.empty or (meta.get("no_permission") is True):
-            _PROBE_BACKOFF[bkey] = now + _PROBE_BACKOFF_SECONDS
-            # basic pacing/backoff to avoid hammering endpoints on repeated failures
-            time.sleep(0.05 + random.random() * 0.1)  # noqa: S311
-            continue
-        df_short, _ = _probe_candidate_history(client, conid, period=probe_period_short)
-        time.sleep(0.02 + random.random() * 0.05)  # noqa: S311
-        last_dt = pd.Timestamp.utcnow().tz_convert("UTC").normalize()
-        try:
-            last_idx = df_long.index.to_timestamp()
-            if getattr(last_idx, "tz", None) is None:
-                last_idx = last_idx.tz_localize("UTC")
-            last_dt = last_idx.max().normalize()
-        except Exception:  # noqa: S110
-            pass
-        # normalize start_dt to UTC naive for comparison
-        sd = start_dt.tz_localize("UTC") if getattr(start_dt, "tz", None) is None else start_dt.tz_convert("UTC")
-        start_long = max(sd, last_dt - pd.Timedelta(days=365))
-        start_short = max(sd, last_dt - pd.Timedelta(days=45))
-        cov_long = _compute_coverage(df_long, start_long, last_dt)
-        cov_short = _compute_coverage(df_short if not df_short.empty else df_long, start_short, last_dt)
-        coverage_norm = 0.7 * cov_long + 0.3 * cov_short
-        prim_rank, exch_rank = _exchange_rank(d)
-        exch_map = {
-            _RANK_EXCH_HIGH: 0.7,
-            _RANK_EXCH_MED: 0.5,
-            _RANK_EXCH_LOW: 0.3,
-        }
-        exch_rank_norm = 1.0 if prim_rank == _RANK_PRIMARY else exch_map.get(exch_rank, 0.0)
-        currency_match = 1.0 if currency(d) == "USD" else 0.0
-        try:
-            age_days = max(0, (pd.Timestamp.now().normalize() - last_dt).days)
-            recency_norm = max(0.0, min(1.0, 1.0 - age_days / 30.0))
-        except Exception:
-            recency_norm = 0.0
-        delay = 0
-        try:
-            delay = int(meta.get("mktDataDelay", 0))
-        except Exception:
-            delay = 0
-        delay_norm = min(1.0, max(0.0, delay / 15.0))
-        stw = _sectype_weight_for(ticker if isinstance(ticker, str) else str(ticker), d)
-        adr_bonus = 0.03 if (_is_adr(d) and prim_rank == _RANK_PRIMARY and currency(d) == "USD") else 0.0
-        score = (
-            1.00 * coverage_norm
-            + 0.10 * (1.0 if prim_rank == _RANK_PRIMARY else 0.0)
-            + 0.05 * exch_rank_norm
-            + 0.05 * currency_match
-            + 0.05 * recency_norm
-            + 0.05 * stw
-            + adr_bonus
-            - 0.05 * delay_norm
-        )
-        scored.append((score, d, df_long, meta))
-
-    if not scored:
+def pick_best_conid(candidates: list[dict]) -> str | None:
+    ranked = score_candidates(candidates)
+    if not ranked:
         return None
+    return str(ranked[0][1].get("conid")) if ranked[0][1].get("conid") else None
 
-    scored.sort(key=lambda x: (x[0], len(x[2])), reverse=True)
-    best_conid = str(scored[0][1].get("conid"))
-    _CONID_CACHE[key] = (best_conid, ts_now)
-    return best_conid
+
+def _resolve_best_conid(client, ticker: str, start_dt: pd.Timestamp, end_dt: pd.Timestamp) -> str | None:
+    """Compatibility wrapper: use simplified resolution without probing/backoff."""
+    cands = resolve_conid_simple(client, ticker)
+    return pick_best_conid(cands)
 
 def _resolve_conid_for_symbol(client, ticker: str) -> str | None:
     """Resolve a ticker to best IBKR conid using probing and US defaults.

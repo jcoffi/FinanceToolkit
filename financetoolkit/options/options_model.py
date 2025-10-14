@@ -30,8 +30,8 @@ def get_option_expiry_dates(ticker: str, enforce_source: str | None = None) -> l
                 expiries = ibind_model.get_option_expiry_dates(ticker)
                 if expiries:
                     return expiries
-        except Exception:
-            pass
+        except Exception:  # noqa: S110
+            ...  # fall through to Yahoo
 
     # Yahoo fallback or enforced
     if enforce_source in (None, "YahooFinance"):
@@ -98,9 +98,8 @@ def get_option_chains(
                 )
                 if isinstance(ib_df, pd.DataFrame) and not ib_df.empty:
                     return ib_df
-        except Exception:
-            # Fall through to Yahoo
-            pass
+        except Exception:  # noqa: S110
+            ...  # Fall through to Yahoo
 
     # Fallback to Yahoo Finance
     if enforce_source in (None, "YahooFinance"):

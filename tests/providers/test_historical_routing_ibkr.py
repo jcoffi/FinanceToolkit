@@ -1,5 +1,5 @@
-import pandas as pd
 import numpy as np
+import pandas as pd
 
 import financetoolkit.historical_model as hist
 import financetoolkit.ibind_model as ib
