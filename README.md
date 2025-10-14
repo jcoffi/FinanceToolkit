@@ -61,6 +61,17 @@ Through the link you are able to subscribe for the free plan and also premium pl
 
 **By default, the Finance Toolkit prioritizes Financial Modeling Prep for data retrieval. If data acquisition from Financial Modeling Prep is unsuccessful (e.g., due to plan restrictions or API key issues), the toolkit automatically switches to Yahoo Finance as a secondary source.** To disable this fallback behavior and exclusively use Financial Modeling Prep, set `enforce_source="FinancialModelingPrep"` during Toolkit initialization. This configuration ensures that an error is raised if Financial Modeling Prep data cannot be accessed. Alternatively, you can set `enforce_source="YahooFinance"` to exclusively use Yahoo Finance as the data source.
 
+If you prefer Interactive Brokers (via iBind) for daily OHLCV and/or historical statistics, set `enforce_source="IBKR"`. The IBKR path currently supports:
+- Daily OHLCV with PeriodIndex, columns: Open, High, Low, Close, Adj Close, Volume
+- Historical statistics (Currency, Symbol, Exchange Name, Instrument Type, First Trade Date, Regular Market Time, GMT Offset, Timezone, Exchange Timezone Name)
+
+Notes:
+- iBind uses OAuth 1.0a to authenticate against api.ibkr.com (no Client Portal needed).
+- Provide credentials via environment variables; secrets are not stored by the toolkit.
+- When not enforced, IBKR is used for historical statistics as a first attempt, with Yahoo Finance and FMP as fallbacks; for OHLCV, IBKR is only used when enforced (1d interval).
+- US venues and USD are prioritized for symbol resolution; SMART is used only as a tiebreak.
+- A small on-disk cache is optionally used to avoid repeated downloads; currency conversion is handled by the existing currencies model when needed.
+
 # Basic Usage
 
 This section is an introduction to the Finance Toolkit. Also see [this notebook](https://www.jeroenbouma.com/projects/financetoolkit/getting-started) for a detailed Getting Started guide as well as [this notebook](https://www.jeroenbouma.com/projects/financetoolkit/finance-database) that includes the [Finance Database 🌎](https://www.jeroenbouma.com/projects/financedatabase) and a proper financial analysis. Next to that, find below a fully-fledged code documentation as well as Jupyter Notebooks in which you can see many examples ranging from basic examples to creating custom ratios to working with your own datasets.
