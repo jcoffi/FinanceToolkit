@@ -621,8 +621,8 @@ def get_historical_data(
                     method="pandas",
                     include_message=False,
                 )
-        except Exception:  # noqa: S110
-            pass
+        except Exception as e:  # noqa: S110
+            logger.debug('ibind: suppressed non-fatal exception: %s', e)
 
         df = helpers.enrich_historical_data(
             historical_data=df,
@@ -678,8 +678,8 @@ def get_historical_statistics(ticker: str) -> pd.Series:
                 stats.loc["Exchange Name"] = data.get("exchange") or data.get("listingExchange")
                 stats.loc["Instrument Type"] = data.get("secType") or "STK"
                 return stats
-        except Exception:  # noqa: S110
-            pass
+        except Exception as e:  # noqa: S110
+            logger.debug('ibind: suppressed non-fatal exception: %s', e)
         try:
             res = client.search_contract_by_symbol(symbol=sym, sec_type="IND")
             data = getattr(res, "data", None)
@@ -762,8 +762,8 @@ def get_option_expiry_dates(ticker: str) -> list[str]:
         expirations = sorted({d for d in expirations if d})
         if expirations:
             return expirations
-    except Exception:  # noqa: S110
-            pass
+    except Exception as e:  # noqa: S110
+            logger.debug('ibind: suppressed non-fatal exception: %s', e)
 
     # Fallback: try secdef info for a few nearby months and collect maturityDate
     outs: set[str] = set()
@@ -786,8 +786,8 @@ def get_option_expiry_dates(ticker: str) -> list[str]:
                                 outs.add(ds)
             except Exception:  # noqa: S112
                 continue
-    except Exception:  # noqa: S110
-            pass
+    except Exception as e:  # noqa: S110
+            logger.debug('ibind: suppressed non-fatal exception: %s', e)
 
     return sorted(outs)
 
