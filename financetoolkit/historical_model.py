@@ -202,30 +202,6 @@ def get_historical_data(
 
                 attempted_fmp = True
 
-            # Try IBKR via iBind when selected or in fallback chain
-            if (
-                enforce_source in ["IBKR"]
-                and historical_data.empty
-                and ENABLE_IBIND
-            ):
-                try:
-                    historical_data = ibind_model.get_historical_data(
-                        ticker=ticker,
-                        start=start,
-                        end=end,
-                        interval=interval,
-                        return_column=return_column,
-                        risk_free_rate=risk_free_rate,
-                        include_dividends=include_dividends,
-                        divide_ohlc_by=divide_ohlc_by,
-                        sleep_timer=sleep_timer,
-                    )
-                except Exception:  # noqa: BLE001
-                    historical_data = pd.DataFrame()
-
-                if not historical_data.empty:
-                    ibkr_tickers.append(ticker)
-
             if (
                 enforce_source not in ["FinancialModelingPrep", "IBKR"]
                 and historical_data.empty
