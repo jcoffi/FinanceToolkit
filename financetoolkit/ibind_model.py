@@ -169,6 +169,9 @@ def _history_payload_to_df(payload: Any) -> pd.DataFrame:
         df[idx_col] = pd.to_datetime(ser, utc=False, errors="coerce")
     df = df.set_index(idx_col).sort_index()
     df.index = _mk_period_index(df.index, freq="D")
+    # Ensure Adj Close present; default to Close when absent
+    if "Adj Close" not in df.columns and "Close" in df.columns:
+        df["Adj Close"] = df["Close"]
     return df
 
 

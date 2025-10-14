@@ -157,8 +157,8 @@ def get_historical_data(
             # Enforced provider still takes precedence where applicable.
             used_ibkr = False
 
-            # Try IBKR first when not explicitly enforcing another provider
-            if enforce_source in [None, "IBKR"] and historical_data.empty:
+            # Try IBKR only when explicitly enforced
+            if enforce_source == "IBKR" and historical_data.empty and interval == "1d":
                 try:
                     historical_data = ibind_model.get_historical_data(
                         ticker=ticker,
@@ -170,6 +170,8 @@ def get_historical_data(
                         include_dividends=include_dividends,
                         divide_ohlc_by=divide_ohlc_by,
                         sleep_timer=sleep_timer,
+                        use_cached_data=True,
+                        cached_data_location="cached",
                     )
                 except Exception:  # noqa: BLE001
                     historical_data = pd.DataFrame()
