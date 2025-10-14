@@ -181,7 +181,10 @@ class Options:
         |          182.5 | AAPL240112C00182500 | USD        |         3.25 |        0 |                0 |    14721 |               0 |     0 |     0 | 2024-01-12   | 2024-01-11        |                    0 | True           |
         |          185   | AAPL240112C00185000 | USD        |         1.18 |        0 |                0 |   102803 |               0 |     0 |     0 | 2024-01-12   | 2024-01-11        |                    0 | True           |
         """
-        expiry_dates = options_model.get_option_expiry_dates(ticker=self._tickers[0], enforce_source=getattr(self, "_enforce_source", None))
+        expiry_dates = options_model.get_option_expiry_dates(
+            ticker=self._tickers[0],
+            enforce_source=self._enforce_source,
+        )
 
         if show_expiration_dates:
             return expiry_dates
@@ -197,7 +200,7 @@ class Options:
             tickers=self._tickers,
             expiration_date=expiration_date,
             put_option=put_option,
-            enforce_source=getattr(self, "_enforce_source", None),
+            enforce_source=self._enforce_source,
         )
 
         option_chains["Change"] = option_chains["Change"].round(
