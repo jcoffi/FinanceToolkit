@@ -40,12 +40,12 @@ def check_dependencies() -> tuple[object | None, object | None]:
     return pmc, _ibkr_utils
 
 
-_EPOCH_MS_THRESHOLD = 1_000_000_000_000
-_CLASS_SUFFIX_MIN = 1
-_CLASS_SUFFIX_MAX = 3
-_CLASS_SUFFIX_MED = 2
-_MIN_REQUIRED_COLUMNS = 5
-_DATE8_LEN = 8
+_EPOCH_MS_THRESHOLD = 1_000_000_000_000  # ms median threshold to detect epoch timestamps vs seconds
+_CLASS_SUFFIX_MIN = 1  # min length of class suffix when normalizing tickers (e.g., BRK B)
+_CLASS_SUFFIX_MAX = 3  # max length of class suffix
+_CLASS_SUFFIX_MED = 2  # typical split length used to detect class suffix pattern
+_MIN_REQUIRED_COLUMNS = 5  # minimum expected OHLCV-like columns in returned payload
+_DATE8_LEN = 8  # length of date strings formatted as YYYYMMDD
 
 
 
@@ -180,33 +180,50 @@ def _history_payload_to_df(payload: Any, freq: str = "D") -> pd.DataFrame:
         df["Adj Close"] = df["Close"]
     return df
 
+def _fetch_history(client, conid: str, period: str = "1y") -> dict | None:
+    """Fetch raw history payload from IBKR API."""
+    res = client.marketdata_history_by_conid(conid=str(conid), bar="1d", period=period)
+    return getattr(res, "data", None)
+
+
+def _extract_metadata(payload: dict | None) -> dict:
+    """Extract metadata from history payload."""
+    meta = {}
+    if isinstance(payload, dict):
+        # capture some metadata if present
+        keys = (
+            "mktDataDelay",
+            "primaryExchange",
+            "exchange",
+            "listingExchange",
+            "symbol",
+            "text",
+            "error",
+            "message",
+        )
+        for k in keys:
+            if k in payload:
+                meta[k] = payload[k]
+        # detect permission errors in known fields
+        msg = str(payload.get("text") or payload.get("error") or payload.get("message") or "").lower()
+        if "permission" in msg:
+            meta["no_permission"] = True
+    return meta
+
+
+def _normalize_bars(payload: dict | None) -> pd.DataFrame:
+    """Normalize payload to OHLCV DataFrame."""
+    return _history_payload_to_df(payload)
+
+
 def _probe_candidate_history(client, conid: str, period: str = "1y") -> tuple[pd.DataFrame, dict]:
     try:
-        res = client.marketdata_history_by_conid(conid=str(conid), bar="1d", period=period)
-        payload = getattr(res, "data", None)
-        meta = {}
-        if isinstance(payload, dict):
-            # capture some metadata if present
-            keys = (
-                "mktDataDelay",
-                "primaryExchange",
-                "exchange",
-                "listingExchange",
-                "symbol",
-                "text",
-                "error",
-                "message",
-            )
-            for k in keys:
-                if k in payload:
-                    meta[k] = payload[k]
-            # detect permission errors in known fields
-            msg = str(payload.get("text") or payload.get("error") or payload.get("message") or "").lower()
-            if "permission" in msg:
-                meta["no_permission"] = True
-        df = _history_payload_to_df(payload)
+        payload = _fetch_history(client, conid, period)
+        meta = _extract_metadata(payload)
+        df = _normalize_bars(payload)
         return df, meta
-    except Exception:
+    except Exception as e:
+        logger.debug("_probe_candidate_history failed for conid %s: %s", conid, e)
         return pd.DataFrame(), {}
 
 def _enrich_candidates_via_secdef(client, conids: list[str]) -> list[dict]:
@@ -272,7 +289,8 @@ def resolve_conid_simple(client, ticker: str) -> list[dict]:
                         conids.append(str(v))
             elif isinstance(data, list):
                 conids = [str(x) for x in data]
-    except Exception:
+    except Exception as e:
+        logger.debug("resolve_conid_simple search fallback failed for %s: %s", sym, e)
         ...
 
     if not conids:
@@ -281,8 +299,9 @@ def resolve_conid_simple(client, ticker: str) -> list[dict]:
             res = client.search_contract_by_symbol(symbol=sym)
             cand = _gather_candidates_from_search(getattr(res, "data", None))
             conids = [str(d.get("conid")) for d in cand if d.get("conid")]
-        except Exception:
-            ...
+        except Exception as e:
+            logger.debug("resolve_conid_simple generic search failed for %s: %s", sym, e)
+            conids = []
         for sec_type in ("STK", "IND"):
             if conids:
                 break
@@ -290,8 +309,9 @@ def resolve_conid_simple(client, ticker: str) -> list[dict]:
                 res2 = client.search_contract_by_symbol(symbol=sym, sec_type=sec_type)
                 cand2 = _gather_candidates_from_search(getattr(res2, "data", None))
                 conids = [str(d.get("conid")) for d in cand2 if d.get("conid")]
-            except Exception:
-                ...
+            except Exception as e:
+                logger.debug("resolve_conid_simple typed search failed for %s sec_type=%s: %s", sym, sec_type, e)
+                continue
 
     # Dedup small set
     conids = [c for i, c in enumerate(conids) if c and c not in conids[:i]]
@@ -403,7 +423,8 @@ def get_intraday_data(
             # Short default window for intraday
             start_dt = end_dt - pd.Timedelta(days=5)
         period = "5d"
-    except Exception:
+    except Exception as e:
+        logger.debug("get_intraday_data date parsing failed for %s: %s", ticker, e)
         return pd.DataFrame()
 
     try:
@@ -428,7 +449,8 @@ def get_intraday_data(
             mask = (ts >= start_dt) & (ts <= end_dt)
             df = df[mask]
         return df
-    except Exception:
+    except Exception as e:
+        logger.debug("get_intraday_data failed for %s: %s", ticker, e)
         return pd.DataFrame()
 
 def get_historical_data(
