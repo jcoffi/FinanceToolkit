@@ -125,16 +125,54 @@ def get_historical_data(
         historical_data = pd.DataFrame()
         attempted_fmp = False
 
-        if api_key and interval in ["1min", "5min", "15min", "30min", "1hour", "4hour"]:
-            historical_data = fmp_model.get_intraday_data(
-                ticker=ticker,
-                api_key=api_key,
-                start=start,
-                end=end,
-                interval=interval,
-                return_column=return_column,
-                sleep_timer=sleep_timer,
-            )
+        if interval in ["1min", "5min", "15min", "30min", "1hour", "4hour"]:
+            # Try IBKR intraday first when available or enforced
+            tried_ibkr = False
+            if enforce_source in [None, "IBKR"]:
+                try:
+                    ibkr_data = ibind_model.get_intraday_data(
+                        ticker=ticker,
+                        start=start,
+                        end=end,
+                        interval=interval,
+                        return_column=return_column,
+                        sleep_timer=sleep_timer,
+                    )
+                    tried_ibkr = True
+                    if ibkr_data is not None and not ibkr_data.empty:
+                        historical_data = ibkr_data
+                except Exception:
+                    pass
+
+            if historical_data.empty and api_key and enforce_source in [None, "FinancialModelingPrep"]:
+                historical_data = fmp_model.get_intraday_data(
+                    ticker=ticker,
+                    api_key=api_key,
+                    start=start,
+                    end=end,
+                    interval=interval,
+                    return_column=return_column,
+                    sleep_timer=sleep_timer,
+                )
+
+            if historical_data.empty and (enforce_source is None) and ENABLE_YFINANCE:
+                # As a last resort for some intervals yfinance may provide 1m/5m via .history
+                try:
+                    from financetoolkit import yfinance_model
+                    yf_intraday = yfinance_model.get_historical_data(
+                        ticker=ticker,
+                        start=start,
+                        end=end,
+                        interval=interval,
+                        return_column=return_column,
+                        risk_free_rate=risk_free_rate,
+                        divide_ohlc_by=divide_ohlc_by,
+                        fallback=False,
+                    )
+                    if not yf_intraday.empty:
+                        historical_data = yf_intraday
+                except Exception:
+                    pass
 
         elif not api_key and interval in [
             "1min",

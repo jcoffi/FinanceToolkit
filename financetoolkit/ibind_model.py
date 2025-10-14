@@ -145,7 +145,7 @@ def _compute_coverage(bars: pd.DataFrame, start_dt: pd.Timestamp, end_dt: pd.Tim
     return min(1.0, covered / expected)
 
 
-def _history_payload_to_df(payload: Any) -> pd.DataFrame:
+def _history_payload_to_df(payload: Any, freq: str = "D") -> pd.DataFrame:
     if not payload:
         return pd.DataFrame()
     if isinstance(payload, dict):
@@ -174,7 +174,7 @@ def _history_payload_to_df(payload: Any) -> pd.DataFrame:
     else:
         df[idx_col] = pd.to_datetime(ser, utc=False, errors="coerce")
     df = df.set_index(idx_col).sort_index()
-    df.index = _mk_period_index(df.index, freq="D")
+    df.index = _mk_period_index(df.index, freq=freq)
     # Ensure Adj Close present; default to Close when absent
     if "Adj Close" not in df.columns and "Close" in df.columns:
         df["Adj Close"] = df["Close"]
@@ -258,6 +258,7 @@ def _resolve_best_conid(client, ticker: str, start_dt: pd.Timestamp, end_dt: pd.
                 return conid_cached
             # invalidate and fall through to resolve
             _CONID_CACHE.pop(key, None)
+
         except Exception:
             _CONID_CACHE.pop(key, None)
 
@@ -520,6 +521,78 @@ def _resolve_conid_for_symbol(client, ticker: str) -> str | None:
         return _resolve_best_conid(client, ticker, start_dt, end_dt)
     except Exception:
         return None
+
+def get_intraday_data(
+    ticker: str,
+    start: str | None = None,
+    end: str | None = None,
+    interval: str = "1min",
+    return_column: str = "Close",
+    sleep_timer: bool = True,
+) -> pd.DataFrame:
+    """Intraday OHLCV via IBKR/iBind if available.
+
+    Returns PeriodIndex with freq 'min' or 'h' depending on interval, columns:
+    [Open, High, Low, Close, Adj Close, Volume]. Empty DataFrame when unavailable.
+    """
+    if not _ibind_available() or not _oauth_configured():
+        return pd.DataFrame()
+
+    # Map Toolkit intervals to IBKR bars
+    interval_map = {
+        "1min": ("1min", "min"),
+        "5min": ("5min", "min"),
+        "15min": ("15min", "min"),
+        "30min": ("30min", "min"),
+        "1hour": ("1h", "h"),
+        "4hour": ("4h", "h"),
+    }
+    if interval not in interval_map:
+        return pd.DataFrame()
+
+    bar, freq = interval_map[interval]
+
+    # Default window per provider constraints
+    try:
+        if end is not None:
+            end_dt = pd.to_datetime(end)
+        else:
+            end_dt = pd.Timestamp.utcnow()
+        if start is not None:
+            start_dt = pd.to_datetime(start)
+            if start_dt > end_dt:
+                return pd.DataFrame()
+        else:
+            # Short default window for intraday
+            start_dt = end_dt - pd.Timedelta(days=5)
+        period = "5d"
+    except Exception:
+        return pd.DataFrame()
+
+    try:
+        from ibind import IbkrClient  # type: ignore
+        client = IbkrClient(use_oauth=True)
+        conid = _resolve_conid_for_symbol(client, ticker)
+        if not conid:
+            return pd.DataFrame()
+        res = client.marketdata_history_by_conid(conid=str(conid), bar=bar, period=period)
+        payload = getattr(res, "data", None)
+        df = _history_payload_to_df(payload, freq=freq)
+        if df.empty:
+            return df
+        # Ensure columns present
+        if "Adj Close" not in df.columns and "Close" in df.columns:
+            df["Adj Close"] = df["Close"]
+        cols = [c for c in ["Open", "High", "Low", "Close", "Adj Close", "Volume"] if c in df.columns]
+        df = df[cols]
+        # Trim to requested window if provided
+        if start is not None or end is not None:
+            ts = df.index.to_timestamp()
+            mask = (ts >= start_dt) & (ts <= end_dt)
+            df = df[mask]
+        return df
+    except Exception:
+        return pd.DataFrame()
 
 
 def get_historical_data(
