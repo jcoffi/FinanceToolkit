@@ -10,6 +10,8 @@ returns empty DataFrames so the caller can handle fallbacks.
 __docformat__ = "google"
 
 import os
+import time
+import random
 from datetime import datetime
 from typing import Any
 
@@ -332,8 +334,11 @@ def _resolve_best_conid(client, ticker: str, start_dt: pd.Timestamp, end_dt: pd.
         df_long, meta = _probe_candidate_history(client, conid, period=probe_period_long)
         # skip if no data or if permissions are missing for this conid
         if df_long.empty or (meta.get("no_permission") is True):
+            # basic pacing/backoff to avoid hammering endpoints on repeated failures
+            time.sleep(0.05 + random.random() * 0.1)
             continue
         df_short, _ = _probe_candidate_history(client, conid, period=probe_period_short)
+        time.sleep(0.02 + random.random() * 0.05)
         last_dt = pd.Timestamp.utcnow().tz_convert('UTC').normalize()
         try:
             last_idx = df_long.index.to_timestamp()
