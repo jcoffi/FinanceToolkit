@@ -239,6 +239,11 @@ def _normalize_symbol_for_ib(sym: str) -> str:
     return s
 
 
+def _is_adr(cand: dict) -> bool:
+    s = (cand.get('localSymbol') or cand.get('tradingClass') or cand.get('symbol') or '')
+    return 'ADR' in str(s).upper()
+
+
 def _resolve_best_conid(client, ticker: str, start_dt: pd.Timestamp, end_dt: pd.Timestamp) -> str | None:
     # Cache check (US scope cache key)
     key = f"US::{ticker.upper()}"
@@ -401,7 +406,8 @@ def _resolve_best_conid(client, ticker: str, start_dt: pd.Timestamp, end_dt: pd.
             delay = 0
         delay_norm = min(1.0, max(0.0, delay / 15.0))
         stw = _sectype_weight_for(ticker if isinstance(ticker, str) else str(ticker), d)
-        score = 1.00 * coverage_norm + 0.10 * (1.0 if prim_rank == 3 else 0.0) + 0.05 * exch_rank_norm + 0.05 * currency_match + 0.05 * recency_norm + 0.05 * stw - 0.05 * delay_norm
+        adr_bonus = 0.03 if (_is_adr(d) and prim_rank == 3 and currency(d) == 'USD') else 0.0
+        score = 1.00 * coverage_norm + 0.10 * (1.0 if prim_rank == 3 else 0.0) + 0.05 * exch_rank_norm + 0.05 * currency_match + 0.05 * recency_norm + 0.05 * stw + adr_bonus - 0.05 * delay_norm
         scored.append((score, d, df_long, meta))
 
     if not scored:
