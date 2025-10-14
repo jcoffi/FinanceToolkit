@@ -16,7 +16,7 @@ from financetoolkit.utilities import error_model, logger_model
 # iBind (IBKR) provider. This module is present in the repo and internally
 # handles absence of the external 'ibind' package or OAuth configuration by
 # returning empty results.
-from financetoolkit import ibind_model  # noqa: F401
+from financetoolkit import ibind_model
 
 logger = logger_model.get_logger()
 
@@ -127,7 +127,6 @@ def get_historical_data(
 
         if interval in ["1min", "5min", "15min", "30min", "1hour", "4hour"]:
             # Try IBKR intraday first when available or enforced
-            tried_ibkr = False
             if enforce_source in [None, "IBKR"]:
                 try:
                     ibkr_data = ibind_model.get_intraday_data(
@@ -138,11 +137,11 @@ def get_historical_data(
                         return_column=return_column,
                         sleep_timer=sleep_timer,
                     )
-                    tried_ibkr = True
+                    # tried_ibkr flag no longer used
                     if ibkr_data is not None and not ibkr_data.empty:
                         historical_data = ibkr_data
-                except Exception:
-                    pass
+                except Exception:  # pragma: no cover - allow fallback if provider errors
+                    ...
 
             if historical_data.empty and api_key and enforce_source in [None, "FinancialModelingPrep"]:
                 historical_data = fmp_model.get_intraday_data(
@@ -158,7 +157,6 @@ def get_historical_data(
             if historical_data.empty and (enforce_source is None) and ENABLE_YFINANCE:
                 # As a last resort for some intervals yfinance may provide 1m/5m via .history
                 try:
-                    from financetoolkit import yfinance_model
                     yf_intraday = yfinance_model.get_historical_data(
                         ticker=ticker,
                         start=start,
@@ -171,8 +169,8 @@ def get_historical_data(
                     )
                     if not yf_intraday.empty:
                         historical_data = yf_intraday
-                except Exception:
-                    pass
+                except Exception:  # pragma: no cover - allow fallback if provider errors
+                    ...
 
         elif not api_key and interval in [
             "1min",
@@ -196,7 +194,6 @@ def get_historical_data(
             # - enforce_source == "FinancialModelingPrep": FMP only
             # - enforce_source == "YahooFinance": Yahoo only
             # - enforce_source is None: IBKR (if available) -> FMP (if api_key) -> Yahoo
-            used_ibkr = False
 
             # 1) IBKR path (only meaningful for daily interval)
             if interval == "1d":
@@ -220,7 +217,7 @@ def get_historical_data(
 
                     if not historical_data.empty:
                         ibkr_tickers.append(ticker)
-                        used_ibkr = True
+                        pass  # used_ibkr flag no longer needed
 
                 elif enforce_source is None and historical_data.empty:
                     # Default: try IBKR first; ibind_model internally returns empty if not available/configured
@@ -243,7 +240,7 @@ def get_historical_data(
 
                     if not historical_data.empty:
                         ibkr_tickers.append(ticker)
-                        used_ibkr = True
+                        pass  # used_ibkr flag no longer needed
 
             # 2) FMP path
             if (
