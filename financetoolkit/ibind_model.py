@@ -50,23 +50,7 @@ _RANK_EXCH_LOW = 1
 _MIN_REQUIRED_COLUMNS = 5
 _DATE8_LEN = 8
 
-_EPOCH_MS_THRESHOLD = 1_000_000_000_000
-_CLASS_SUFFIX_MIN = 1
-_CLASS_SUFFIX_MAX = 3
-_RANK_PRIMARY = 3
-_RANK_EXCH_HIGH = 3
-_RANK_EXCH_MED = 2
-_RANK_EXCH_LOW = 1
 
-try:
-    import pandas_market_calendars as pmc  # type: ignore
-except Exception:  # pragma: no cover - optional dep
-    pmc = None
-
-try:
-    from ibind.client import ibkr_utils as _ibkr_utils  # type: ignore
-except Exception:  # pragma: no cover - optional dep
-    _ibkr_utils = None
 
 def _ibind_available() -> bool:
     try:
