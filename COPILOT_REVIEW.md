@@ -1,1 +1,0 @@
-Placeholder Copilot review: Looks good overall, consider catching specific exceptions instead of broad Exception in _save_cached_if_enabled.
