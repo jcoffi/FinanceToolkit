@@ -68,6 +68,7 @@ If you prefer Interactive Brokers (via iBind) for daily OHLCV and/or historical 
 Notes:
 - iBind uses OAuth 1.0a to authenticate against api.ibkr.com (no Client Portal needed).
 - Provide credentials via environment variables; secrets are not stored by the toolkit.
+- For OAuth 1.0a configuration instructions, see the iBind documentation: https://github.com/Voyz/ibind
 - When not enforced, IBKR is used for historical statistics as a first attempt, with Yahoo Finance and FMP as fallbacks; for OHLCV, IBKR is only used when enforced (1d interval).
 - US venues and USD are prioritized for symbol resolution; SMART is used only as a tiebreak.
 - A small on-disk cache is optionally used to avoid repeated downloads; currency conversion is handled by the existing currencies model when needed.
