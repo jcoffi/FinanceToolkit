@@ -277,8 +277,13 @@ def _load_cached_if_enabled(use_cached_data: bool | str, cached_data_location: s
     """Load cached data when caching is enabled. Returns DataFrame or None."""
     if not use_cached_data:
         return None
+    # Import errors indicate caching subsystem not available; propagate as no-cache
     try:
         from financetoolkit.utilities import cache_model  # noqa: E402
+    except (ImportError, ModuleNotFoundError):
+        return None
+
+    try:
         cached = cache_model.load_cached_data(
             cached_data_location=cached_data_location if isinstance(use_cached_data, str) else "cached",
             file_name=cache_key,
@@ -287,7 +292,9 @@ def _load_cached_if_enabled(use_cached_data: bool | str, cached_data_location: s
         )
         if isinstance(cached, pd.DataFrame) and not cached.empty:
             return cached
-    except Exception:
+    except Exception as e:
+        # Non-fatal: treat any cache load failure as cache-miss but surface debug logs
+        logger.debug("ibind: cache load failed for %s: %s", cache_key, e)
         return None
     return None
 
@@ -298,6 +305,11 @@ def _save_cached_if_enabled(use_cached_data: bool | str, cached_data_location: s
         return
     try:
         from financetoolkit.utilities import cache_model  # noqa: E402
+    except (ImportError, ModuleNotFoundError) as ie:
+        logger.debug("ibind: cache subsystem not available: %s", ie)
+        return
+
+    try:
         cache_model.save_cached_data(
             cached_data=df,
             cached_data_location=cached_data_location if isinstance(use_cached_data, str) else "cached",
@@ -305,8 +317,8 @@ def _save_cached_if_enabled(use_cached_data: bool | str, cached_data_location: s
             method="pandas",
             include_message=False,
         )
-    except Exception as e:  # noqa: S110
-        logger.debug("ibind: suppressed non-fatal exception: %s", e)
+    except Exception as e:  # catching save-time issues (IO, serialization, etc.)
+        logger.debug("ibind: cache save failed for %s: %s", cache_key, e)
 
 
 def _enrich_candidates_via_secdef(client, conids: list[str]) -> list[dict]:
