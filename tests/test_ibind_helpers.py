@@ -2,7 +2,7 @@ import pandas as pd
 import numpy as np
 import pytest
 
-from financetoolkit.financetoolkit import ibind_model as ib
+import financetoolkit.ibind_model as ib
 
 
 def test_parse_dates_defaults_and_explicit():
@@ -53,7 +53,10 @@ def test_load_and_save_cache_cycle(tmp_path, monkeypatch):
         def save_cached_data(cached_data, cached_data_location, file_name, method, include_message):
             calls['saved'] = (cached_data_location, file_name)
 
-    monkeypatch.setitem(__import__('sys').modules, 'financetoolkit.utilities.cache_model', DummyCache)
+    import types, sys
+    util_mod = types.ModuleType('financetoolkit.utilities')
+    util_mod.cache_model = DummyCache
+    monkeypatch.setitem(sys.modules, 'financetoolkit.utilities', util_mod)
 
     key = "test_cache_key"
     df = pd.DataFrame({"A": [1, 2, 3]})
