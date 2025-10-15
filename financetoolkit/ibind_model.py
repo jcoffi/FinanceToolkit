@@ -75,18 +75,28 @@ def _mk_period_index(idx: pd.Index, freq: str = "D") -> pd.PeriodIndex:
         return idx.to_period(freq=freq)
 
 def _gather_candidates_from_search(obj: Any) -> list[dict]:
+    """Iteratively collect candidate dicts containing a 'conid' from a nested
+    search payload.
+
+    This replaces the previous recursive implementation with an explicit stack
+    traversal which is easier to reason about and avoids deep recursion.
+    """
+    if not obj:
+        return []
     out: list[dict] = []
-    def rec(x: Any):
+    stack = [obj]
+    while stack:
+        x = stack.pop()
         if isinstance(x, dict):
-            # normalize dict with conid
             if x.get("conid"):
                 out.append(x)
             for v in x.values():
-                rec(v)
+                if isinstance(v, (dict, list)):
+                    stack.append(v)
         elif isinstance(x, list):
             for v in x:
-                rec(v)
-    rec(obj)
+                if isinstance(v, (dict, list)):
+                    stack.append(v)
     # deduplicate by conid preserving order
     seen = set()
     uniq: list[dict] = []
@@ -226,6 +236,79 @@ def _probe_candidate_history(client, conid: str, period: str = "1y") -> tuple[pd
         logger.debug("_probe_candidate_history failed for conid %s: %s", conid, e)
         return pd.DataFrame(), {}
 
+# --- New helper functions to split responsibilities for get_historical_data ---
+
+def _parse_dates(start: str | None, end: str | None, lookback_years: int = 10) -> tuple[str, str, datetime, datetime]:
+    """Parse start/end strings into datetime objects and normalized strings.
+
+    Returns (start_str, end_str, start_dt, end_dt). If parsing fails, raises ValueError.
+    If start or end is None, defaults are applied: end defaults to today, start to end - lookback_years.
+    """
+    if end is not None:
+        end_dt = datetime.strptime(end, "%Y-%m-%d")
+    else:
+        end_dt = datetime.today()
+        end = end_dt.strftime("%Y-%m-%d")
+
+    if start is not None:
+        try:
+            start_dt = datetime.strptime(start, "%Y-%m-%d")
+        except Exception as e:
+            raise ValueError("Invalid start date format, expected YYYY-MM-DD") from e
+    else:
+        start_dt = end_dt.replace(year=end_dt.year - lookback_years)
+        start = start_dt.strftime("%Y-%m-%d")
+
+    return start, end, start_dt, end_dt
+
+
+def _determine_bar_and_period(interval: str) -> tuple[str, str]:
+    """Map requested interval to iBind bar and period strings.
+
+    Returns (bar, period). For now, we keep a sensible default of period='1y'
+    and map common intervals to supported bars.
+    """
+    bar = interval if interval in {"1min", "5min", "15min", "30min", "1h", "4h", "1d"} else "1d"
+    period = "1y"
+    return bar, period
+
+
+def _load_cached_if_enabled(use_cached_data: bool | str, cached_data_location: str, cache_key: str) -> pd.DataFrame | None:
+    """Load cached data when caching is enabled. Returns DataFrame or None."""
+    if not use_cached_data:
+        return None
+    try:
+        from financetoolkit.utilities import cache_model  # noqa: E402
+        cached = cache_model.load_cached_data(
+            cached_data_location=cached_data_location if isinstance(use_cached_data, str) else "cached",
+            file_name=cache_key,
+            method="pandas",
+            return_empty_type=pd.DataFrame(),
+        )
+        if isinstance(cached, pd.DataFrame) and not cached.empty:
+            return cached
+    except Exception:
+        return None
+    return None
+
+
+def _save_cached_if_enabled(use_cached_data: bool | str, cached_data_location: str, cache_key: str, df: pd.DataFrame) -> None:
+    """Save dataframe to cache when caching is enabled. Suppresses errors."""
+    if not use_cached_data:
+        return
+    try:
+        from financetoolkit.utilities import cache_model  # noqa: E402
+        cache_model.save_cached_data(
+            cached_data=df,
+            cached_data_location=cached_data_location if isinstance(use_cached_data, str) else "cached",
+            file_name=cache_key,
+            method="pandas",
+            include_message=False,
+        )
+    except Exception as e:  # noqa: S110
+        logger.debug("ibind: suppressed non-fatal exception: %s", e)
+
+
 def _enrich_candidates_via_secdef(client, conids: list[str]) -> list[dict]:
     if not conids:
         return []
@@ -324,36 +407,30 @@ def resolve_conid_simple(client, ticker: str) -> list[dict]:
 
 
 def score_candidates(candidates: list[dict]) -> list[tuple[float, dict]]:
-    """Pure scoring: US-first, USD-first, primaryExchange over SMART, small ADR bonus."""
-    def exch_name(d: dict) -> str:
-        return str(
-            d.get("primaryExchange")
-            or d.get("primary_exchange")
-            or d.get("exchange")
-            or d.get("listingExchange")
-            or ""
-        )
+    """Deterministic priority scoring without magic floats.
 
-    def currency(d: dict) -> str:
+    We convert the previous float-based heuristic into a tuple of discrete
+    priorities so ordering is predictable and easier to reason about. Higher
+    tuple values are better; final tiebreaker is original candidate order.
+    """
+    def currency_upper(d: dict) -> str:
         return str(d.get("currency") or "").upper()
 
-    out: list[tuple[float, dict]] = []
-    for d in candidates:
-        prim, exch = _exchange_rank(d)
-        score = 0.0
-        # Prefer primary US exchanges
-        score += 1.0 if prim == _RANK_PRIMARY else 0.0
-        # Prefer known US exchanges and penalize SMART router as sole exchange
-        score += 0.3 if exch == _RANK_EXCH_HIGH else (0.1 if exch == _RANK_EXCH_MED else 0.0)
-        # Prefer USD
-        score += 0.3 if currency(d) == "USD" else 0.0
-        # ADR slight bonus as final tie-breaker when already US/USD
-        is_adr = _is_adr(d)
-        score += 0.05 if is_adr and prim == _RANK_PRIMARY and currency(d) == "USD" else 0.0
-        out.append((score, d))
-    # Highest first
-    out.sort(key=lambda x: x[0], reverse=True)
-    return out
+    prioritized: list[tuple[tuple[int, int, int, int], int, dict]] = []
+    for idx, d in enumerate(candidates):
+        prim_rank, exch_rank = _exchange_rank(d)
+        is_us_primary = 1 if prim_rank == _RANK_PRIMARY else 0
+        is_us_exchange = 1 if exch_rank == _RANK_EXCH_HIGH else (0 if exch_rank == 0 else 0)
+        is_usd = 1 if currency_upper(d) == "USD" else 0
+        adr_bonus = 1 if _is_adr(d) and is_us_primary and is_usd else 0
+        # Compose priority tuple: (primary, exchange_high, usd, adr_bonus)
+        priority = (is_us_primary, is_us_exchange, is_usd, adr_bonus)
+        # Use idx as final tiebreaker to preserve input ordering
+        prioritized.append((priority, -idx, d))
+    # Sort descending by priority tuple then by input order
+    prioritized.sort(key=lambda x: (x[0], x[1]), reverse=True)
+    # Convert to expected output format (score, dict) where score is the priority tuple
+    return [(p[0], p[2]) for p in prioritized]
 
 
 def pick_best_conid(candidates: list[dict]) -> str | None:
@@ -535,76 +612,33 @@ def get_historical_data(
                 )
                 return df
 
-        # Fetch history by conid
-        result = client.marketdata_history_by_conid(
-            conid=str(conid), period=period, bar=bar
-        )
-        payload: Any = getattr(result, "data", None)
+        # Fetch history by conid (use helper thin wrappers to simplify responsibilities)
+        # Attempt to reuse existing _fetch_history and _history_payload_to_df helpers.
+        payload = _fetch_history(client, str(conid), period=period)
         if not payload:
             return pd.DataFrame()
 
-        # iBind/IBKR returns a dict with a nested 'data' list for history
-        if isinstance(payload, dict):
-            data = payload.get("data") or payload.get("points") or payload.get("bars")
-        elif isinstance(payload, list):
-            data = payload
-        else:
-            data = None
-        if not isinstance(data, list) or not data:
+        df = _history_payload_to_df(payload, freq="D")
+        if df.empty:
             return pd.DataFrame()
 
-        # Expected shape from iBind: list of dicts with fields like t, o, h, l, c, v
-        df = pd.DataFrame(data)
-        # Common field names per ibind examples
-        rename_map = {
-            "o": "Open",
-            "h": "High",
-            "l": "Low",
-            "c": "Close",
-            "v": "Volume",
-            "adj": "Adj Close",
-            "t": "Date",
-        }
-        df = df.rename(columns=rename_map)
-
-        # If Adj Close not provided, mirror Close
+        # Ensure Adj Close present
         if "Adj Close" not in df.columns and "Close" in df.columns:
             df["Adj Close"] = df["Close"].to_numpy()
-
-        # Build index: attempt epoch ms/s handling if numeric
-        idx_col = "Date" if "Date" in df.columns else None
-        if idx_col is None:
-            for cand in ("time", "ts"):
-                if cand in df.columns:
-                    idx_col = cand
-                    break
-        if idx_col is None:
-            return pd.DataFrame()
-
-        ser = df[idx_col]
-        if np.issubdtype(ser.dtype, np.number):
-            try:
-                unit = "ms" if float(pd.Series(ser).median()) > _EPOCH_MS_THRESHOLD else "s"
-            except Exception:
-                unit = "ms"
-            df[idx_col] = pd.to_datetime(ser, unit=unit, utc=False, errors="coerce")
-        else:
-            df[idx_col] = pd.to_datetime(ser, utc=False, errors="coerce")
-        df = df.set_index(idx_col).sort_index()
-        df.index = _mk_period_index(df.index, freq="D")
 
         # Keep required columns
         cols = ["Open", "High", "Low", "Close", "Adj Close", "Volume"]
         present = [c for c in cols if c in df.columns]
-        if len(present) < _MIN_REQUIRED_COLUMNS:  # require at least OHLCV; Adj Close may be synthesized
+        if len(present) < _MIN_REQUIRED_COLUMNS:
             return pd.DataFrame()
         df = df[[c for c in cols if c in df.columns]]
 
+        # Apply divide_ohlc_by if requested
         if divide_ohlc_by:
             np.seterr(divide="ignore", invalid="ignore")
             df = df.div(divide_ohlc_by)
 
-        # Include dividends column if available from API; else set to 0 if requested
+        # Include dividends column default
         if include_dividends and "Dividends" not in df.columns:
             df["Dividends"] = 0.0
 
@@ -622,8 +656,9 @@ def get_historical_data(
                     include_message=False,
                 )
         except Exception as e:  # noqa: S110
-            logger.debug('ibind: suppressed non-fatal exception: %s', e)
+            logger.debug("ibind: suppressed non-fatal exception: %s", e)
 
+        # Final enrichment (unchanged behavior)
         df = helpers.enrich_historical_data(
             historical_data=df,
             start=start,
