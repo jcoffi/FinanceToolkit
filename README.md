@@ -59,7 +59,30 @@ ___
 
 Through the link you are able to subscribe for the free plan and also premium plans at a **15% discount**. This is an affiliate link and thus supports the project at the same time. I have chosen FinancialModelingPrep as a source as I find it to be the most transparent, reliable and at an affordable price. I have yet to find a platform offering such low prices for the amount of data offered. When you notice that the data is inaccurate or have any other issue related to the data, note that I simply provide the means to access this data and I am not responsible for the accuracy of the data itself. For this, use [their contact form](https://site.financialmodelingprep.com/contact) or provide the data yourself.
 
-**By default, the Finance Toolkit prioritizes Financial Modeling Prep for data retrieval. If data acquisition from Financial Modeling Prep is unsuccessful (e.g., due to plan restrictions or API key issues), the toolkit automatically switches to Yahoo Finance as a secondary source.** To disable this fallback behavior and exclusively use Financial Modeling Prep, set `enforce_source="FinancialModelingPrep"` during Toolkit initialization. This configuration ensures that an error is raised if Financial Modeling Prep data cannot be accessed. Alternatively, you can set `enforce_source="YahooFinance"` to exclusively use Yahoo Finance as the data source.
+**By default, the Finance Toolkit prioritizes IBKR via iBind for daily OHLCV and options when OAuth is configured. Otherwise, it prioritizes Financial Modeling Prep when an API key is provided and finally falls back to Yahoo Finance.** To disable this fallback behavior and exclusively use a provider, set `enforce_source` during Toolkit initialization. For example, `enforce_source="FinancialModelingPrep"` or `enforce_source="YahooFinance"` or `enforce_source="IBKR"`.
+
+If you prefer Interactive Brokers (via iBind) for daily OHLCV and/or historical statistics, set `enforce_source="IBKR"`. The IBKR path currently supports:
+- Daily OHLCV with PeriodIndex, columns: Open, High, Low, Close, Adj Close, Volume
+- Historical statistics (Currency, Symbol, Exchange Name, Instrument Type, First Trade Date, Regular Market Time, GMT Offset, Timezone, Exchange Timezone Name)
+
+Notes:
+- iBind uses OAuth 1.0a to authenticate against api.ibkr.com (no Client Portal needed).
+- Provide credentials via environment variables; secrets are not stored by the toolkit.
+- When not enforced, IBKR is used for historical statistics as a first attempt, with Yahoo Finance and FMP as fallbacks; for OHLCV, IBKR is only used when enforced (1d interval).
+- US venues and USD are prioritized for symbol resolution; SMART is used only as a tiebreak.
+- A small on-disk cache is optionally used to avoid repeated downloads; currency conversion is handled by the existing currencies model when needed.
+
+Resolver scoring (US-first, USD-first):
+- Coverage (weight 1.00): observed_bars / expected_bars in the requested window.
+- US primary exchange bonus (weight 0.10): +0.10 if primaryExchange is NYSE or NASDAQ.
+- Exchange rank (weight 0.05): favors NYSE/NASDAQ over ARCA/SMART/others.
+- Currency match (weight 0.05): +0.05 for USD instruments.
+- Recency (weight 0.05): favors fresher last trade dates.
+- secType (weight 0.05): small preference for common stock versus other types when multiple are offered.
+- Delay penalty (weight -0.05): penalizes larger reported mktDataDelay.
+- ADR tiebreaker (+0.03): an additional bonus is applied when all are true: detected ADR instrument, primaryExchange in {NYSE, NASDAQ}, and currency USD. This does not override poor coverage or stale data; it only breaks near-ties among US, USD candidates.
+
+The resolver excludes candidates without market data permissions, applies per-ticker backoff, and maintains a short TTL cache with quick revalidation to avoid reusing stale or unauthorized contracts.
 
 # Basic Usage
 
@@ -567,7 +590,9 @@ Which returns:
 | 2022   | 128.41   | 129.95   | 127.43   | 129.93   |    129.378  | 7.70342e+07 |    0.91     | -0.264042  |     0.356964 |      -0.302832  |            0.377293 |             7.35566 |
 | 2023   | 187.84   | 188.51   | 187.68   | 188.108  |    188.108  | 4.72009e+06 |    0.71     |  0.453941  |     0.213359 |       0.412901  |            0.22327  |            10.6947  |
 
-It is also possible to retrieve [intraday data](https://www.jeroenbouma.com/projects/financetoolkit/docs#get_intraday_data). This has the option to get you 1 minute, 5 minute, 15 minute, 30 minute or 1 hour data. It can also be used as part of the Risk, Performance and Technicals modules when defining `intraday_period` as part of the Toolkit initialization. 
+It is also possible to retrieve [intraday data](https://www.jeroenbouma.com/projects/financetoolkit/docs#get_intraday_data). This has the option to get you 1 minute, 5 minute, 15 minute, 30 minute or 1 hour data. It can also be used as part of the Risk, Performance and Technicals modules when defining `intraday_period` as part of the Toolkit initialization.
+
+Note on IBKR/iBind support: When OAuth 1.0a environment variables for iBind/IBKR are present, the Toolkit will attempt IBKR first for both daily and intraday market data by default (unless `enforce_source` is set). If IBKR returns no data or permissions are missing, FinanceToolkit falls back to FinancialModelingPrep (when `api_key` is provided) and then Yahoo Finance. To explicitly select IBKR, pass `enforce_source="IBKR"` to the Toolkit. Configure iBind via environment variables (for example: `IBIND_USE_OAUTH`, `IBIND_OAUTH1A_CONSUMER_KEY`, `IBIND_OAUTH1A_ACCESS_TOKEN`, `IBIND_OAUTH1A_ACCESS_TOKEN_SECRET`, `IBIND_OAUTH1A_ENCRYPTION_KEY_FP`, `IBIND_OAUTH1A_SIGNATURE_KEY_FP`, and `IBIND_OAUTH1A_DH_PRIME`). Do not commit secrets to version control; store them securely (e.g., environment variables or a local secrets store). 
 
 As an example:
 

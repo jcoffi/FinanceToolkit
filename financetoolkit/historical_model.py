@@ -10,7 +10,7 @@ import numpy as np
 import pandas as pd
 from tqdm import tqdm
 
-from financetoolkit import fmp_model, yfinance_model
+from financetoolkit import fmp_model, ibind_model, yfinance_model
 from financetoolkit.utilities import error_model, logger_model
 
 logger = logger_model.get_logger()
@@ -120,16 +120,52 @@ def get_historical_data(
         historical_data = pd.DataFrame()
         attempted_fmp = False
 
-        if api_key and interval in ["1min", "5min", "15min", "30min", "1hour", "4hour"]:
-            historical_data = fmp_model.get_intraday_data(
-                ticker=ticker,
-                api_key=api_key,
-                start=start,
-                end=end,
-                interval=interval,
-                return_column=return_column,
-                sleep_timer=sleep_timer,
-            )
+        if interval in ["1min", "5min", "15min", "30min", "1hour", "4hour"]:
+            # Try IBKR intraday first when available or enforced
+            if enforce_source in [None, "IBKR"]:
+                try:
+                    ibkr_data = ibind_model.get_intraday_data(
+                        ticker=ticker,
+                        start=start,
+                        end=end,
+                        interval=interval,
+                        return_column=return_column,
+                        sleep_timer=sleep_timer,
+                    )
+                    # tried_ibkr flag no longer used
+                    if ibkr_data is not None and not ibkr_data.empty:
+                        historical_data = ibkr_data
+                except Exception:  # pragma: no cover - allow fallback if provider errors
+                    ...
+
+            if historical_data.empty and api_key and enforce_source in [None, "FinancialModelingPrep"]:
+                historical_data = fmp_model.get_intraday_data(
+                    ticker=ticker,
+                    api_key=api_key,
+                    start=start,
+                    end=end,
+                    interval=interval,
+                    return_column=return_column,
+                    sleep_timer=sleep_timer,
+                )
+
+            if historical_data.empty and (enforce_source is None) and ENABLE_YFINANCE:
+                # As a last resort for some intervals yfinance may provide 1m/5m via .history
+                try:
+                    yf_intraday = yfinance_model.get_historical_data(
+                        ticker=ticker,
+                        start=start,
+                        end=end,
+                        interval=interval,
+                        return_column=return_column,
+                        risk_free_rate=risk_free_rate,
+                        divide_ohlc_by=divide_ohlc_by,
+                        fallback=False,
+                    )
+                    if not yf_intraday.empty:
+                        historical_data = yf_intraday
+                except Exception:  # pragma: no cover - allow fallback if provider errors
+                    ...
 
         elif not api_key and interval in [
             "1min",
@@ -148,7 +184,65 @@ def get_historical_data(
                 "above affiliate link which also supports the project."
             )
         else:
-            if api_key and enforce_source in [None, "FinancialModelingPrep"]:
+            # Daily routing logic with enforce_source rules and default fallback:
+            # - enforce_source == "IBKR": IBKR only (1d supported)
+            # - enforce_source == "FinancialModelingPrep": FMP only
+            # - enforce_source == "YahooFinance": Yahoo only
+            # - enforce_source is None: IBKR (if available) -> FMP (if api_key) -> Yahoo
+
+            # 1) IBKR path (only meaningful for daily interval)
+            if interval == "1d":
+                if enforce_source == "IBKR" and historical_data.empty:
+                    try:
+                        historical_data = ibind_model.get_historical_data(
+                            ticker=ticker,
+                            start=start,
+                            end=end,
+                            interval=interval,
+                            return_column=return_column,
+                            risk_free_rate=risk_free_rate,
+                            include_dividends=include_dividends,
+                            divide_ohlc_by=divide_ohlc_by,
+                            sleep_timer=sleep_timer,
+                            use_cached_data=True,
+                            cached_data_location="cached",
+                        )
+                    except Exception:  # noqa: BLE001
+                        historical_data = pd.DataFrame()
+
+                    if not historical_data.empty:
+                        ibkr_tickers.append(ticker)
+                        pass  # used_ibkr flag no longer needed
+
+                elif enforce_source is None and historical_data.empty:
+                    # Default: try IBKR first; ibind_model internally returns empty if not available/configured
+                    try:
+                        historical_data = ibind_model.get_historical_data(
+                            ticker=ticker,
+                            start=start,
+                            end=end,
+                            interval=interval,
+                            return_column=return_column,
+                            risk_free_rate=risk_free_rate,
+                            include_dividends=include_dividends,
+                            divide_ohlc_by=divide_ohlc_by,
+                            sleep_timer=sleep_timer,
+                            use_cached_data=True,
+                            cached_data_location="cached",
+                        )
+                    except Exception:  # noqa: BLE001
+                        historical_data = pd.DataFrame()
+
+                    if not historical_data.empty:
+                        ibkr_tickers.append(ticker)
+                        pass  # used_ibkr flag no longer needed
+
+            # 2) FMP path
+            if (
+                api_key
+                and historical_data.empty
+                and enforce_source in [None, "FinancialModelingPrep"]
+            ):
                 historical_data = fmp_model.get_historical_data(
                     ticker=ticker,
                     api_key=api_key,
@@ -167,9 +261,10 @@ def get_historical_data(
 
                 attempted_fmp = True
 
+            # 3) Yahoo path
             if (
-                enforce_source != "FinancialModelingPrep"
-                and historical_data.empty
+                historical_data.empty
+                and ((enforce_source is None) or (enforce_source == "YahooFinance"))
                 and ENABLE_YFINANCE
             ):
                 historical_data = yfinance_model.get_historical_data(
@@ -208,6 +303,7 @@ def get_historical_data(
     historical_data_error_dict: dict[str, pd.DataFrame] = {}
     fmp_tickers: list[str] = []
     yf_tickers: list[str] = []
+    ibkr_tickers: list[str] = []
     no_data: list[str] = []
     threads = []
 
@@ -252,6 +348,12 @@ def get_historical_data(
             "API limits or usage of the Free plan.\n"
             "Therefore data was retrieved from YahooFinance instead for: %s",
             ", ".join(yf_tickers),
+        )
+
+    if ibkr_tickers and show_ticker_seperation:
+        logger.info(
+            "The following tickers acquired historical data from IBKR (iBind): %s",
+            ", ".join(ibkr_tickers),
         )
 
     if no_data and show_errors:
@@ -416,6 +518,7 @@ def convert_daily_to_other_period(
 def get_historical_statistics(
     tickers: list[str] | str,
     api_key: str | None = None,
+    enforce_source: str | None = None,
     progress_bar: bool = True,
     show_errors: bool = False,
     tqdm_message: str = "Obtaining historical statistics",
@@ -456,12 +559,25 @@ def get_historical_statistics(
     def worker(ticker, historical_statistics_dict):
         historical_statistics = pd.DataFrame()
 
-        if historical_statistics.empty:
+        # Default order: IBKR first, then Yahoo, then FMP (if allowed)
+        if enforce_source in [None, "IBKR"]:
+            try:
+                hist_series = ibind_model.get_historical_statistics(ticker)
+                if not hist_series.empty:
+                    historical_statistics = hist_series
+            except Exception:  # noqa: BLE001
+                historical_statistics = pd.DataFrame()
+
+        if historical_statistics.empty and enforce_source in [None, "YahooFinance"]:
             historical_statistics = yfinance_model.get_historical_statistics(
                 ticker=ticker
             )
 
-        if api_key and historical_statistics.empty:
+        if (
+            api_key
+            and historical_statistics.empty
+            and enforce_source in [None, "FinancialModelingPrep"]
+        ):
             historical_statistics = fmp_model.get_historical_statistics(
                 ticker=ticker,
                 api_key=api_key,
@@ -470,7 +586,17 @@ def get_historical_statistics(
         if historical_statistics.empty:
             no_data.append(ticker)
         if not historical_statistics.empty:
-            historical_statistics_dict[ticker] = historical_statistics
+            if (
+                isinstance(historical_statistics, pd.DataFrame)
+                and historical_statistics.columns.equals(pd.Index([ticker]))
+            ):
+                historical_statistics_dict[ticker] = historical_statistics[ticker]
+            elif isinstance(historical_statistics, pd.Series):
+                historical_statistics_dict[ticker] = historical_statistics
+            else:
+                # yfinance and fmp return Series; ensure Series
+                historical_statistics_dict[ticker] = historical_statistics.squeeze()
+
 
     if isinstance(tickers, str):
         ticker_list = [tickers]
@@ -516,3 +642,4 @@ def get_historical_statistics(
         return historical_statistics, no_data
 
     return pd.DataFrame(), no_data
+
